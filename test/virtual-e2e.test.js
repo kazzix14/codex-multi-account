@@ -53,7 +53,7 @@ function writeIncompleteSession() {
   const dir = path.join(home, 'sessions', '2026', '06', '04');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'rollout-e2e.jsonl'), [
-    JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: '019eaaaa-bbbb-7ccc-8ddd-000000000001', cwd: process.cwd() } }),
+    JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: '019eaaaa-bbbb-7ccc-8ddd-000000000001', cwd: process.cwd(), source: 'cli' } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-e2e' } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'implement feature' }] } })
   ].join('\\n') + '\\n');
@@ -62,7 +62,7 @@ function writeUsageLimitedCompleteSession() {
   const dir = path.join(home, 'sessions', '2026', '06', '04');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'rollout-e2e.jsonl'), [
-    JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: '019eaaaa-bbbb-7ccc-8ddd-000000000002', cwd: process.cwd() } }),
+    JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: '019eaaaa-bbbb-7ccc-8ddd-000000000002', cwd: process.cwd(), source: 'cli' } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-e2e' } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'new request' }] } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'token_count', rate_limits: { credits: { has_credits: false }, rate_limit_reached_type: null } } }),
@@ -73,7 +73,7 @@ function writeQueuedFollowupUsageLimitedSession() {
   const dir = path.join(home, 'sessions', '2026', '06', '04');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'rollout-e2e.jsonl'), [
-    JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: '019eaaaa-bbbb-7ccc-8ddd-000000000003', cwd: process.cwd() } }),
+    JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: '019eaaaa-bbbb-7ccc-8ddd-000000000003', cwd: process.cwd(), source: 'cli' } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-e2e' } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'make screen capture work' }] } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'I am updating the scene.' }] } }),
@@ -87,7 +87,7 @@ function writeFastSwitchedUsageLimitedSession() {
   const dir = path.join(home, 'sessions', '2026', '06', '04');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'rollout-e2e.jsonl'), [
-    JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: '019eaaaa-bbbb-7ccc-8ddd-000000000004', cwd: process.cwd() } }),
+    JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: '019eaaaa-bbbb-7ccc-8ddd-000000000004', cwd: process.cwd(), source: 'cli' } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: 'turn_context', payload: { effort: 'xhigh', collaboration_mode: { settings: { reasoning_effort: 'xhigh' } } } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-e2e' } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '/fast' }] } }),
@@ -125,6 +125,11 @@ if (args[0] === 'app-server') {
       if (!line) continue;
       const msg = JSON.parse(line);
       if (msg.method === 'initialize') send({ id: msg.id, result: { ok: true } });
+      if (msg.method === 'account/read') {
+        append({ type: 'account-read', home, params: msg.params });
+        if (process.env.FAKE_REFRESH_ERROR === '1') send({ id: msg.id, error: { message: 'refresh rejected' } });
+        else send({ id: msg.id, result: { account: { type: 'chatgpt' } } });
+      }
       if (msg.method === 'account/rateLimits/read') {
         append({ type: 'limit-read', home });
         if (process.env.FAKE_LIMIT_ERROR) {
@@ -143,6 +148,7 @@ if (args[0] === 'app-server') {
         } } } });
       }
       if (msg.method === 'thread/goal/get') {
+        append({ type: 'goal-get', home, params: msg.params });
         const status = goals()[msg.params.threadId];
         send({ id: msg.id, result: { goal: status ? {
           threadId: msg.params.threadId,
@@ -197,12 +203,14 @@ if (args[0] === 'app-server') {
     } else {
       writeIncompleteSession();
     }
+    const sessionNumber = ({ 'usage-complete': '2', 'queued-follow-up': '3', 'fast-switched': '4' })[process.env.FAKE_LIMIT_SESSION] || '1';
+    const threadId = process.env.FAKE_LIMIT_SESSION === 'no-id-usage-complete' ? '' : '019eaaaa-bbbb-7ccc-8ddd-00000000000' + sessionNumber;
     if (process.env.FAKE_LIMIT_LOG === 'out-of-credits') {
-      writeLog('2026-06-04T03:28:15.620801Z  INFO session_loop{thread_id=019e907c}:turn{model=gpt-5.5}: codex_core::session::turn: Turn error: Your workspace is out of credits. Add credits to continue.');
+      writeLog('2026-06-04T03:28:15.620801Z  INFO session_loop{thread_id=' + threadId + '}:turn{model=gpt-5.5}: codex_core::session::turn: Turn error: Your workspace is out of credits. Add credits to continue.');
     } else if (process.env.FAKE_LIMIT_LOG === 'goal') {
-      writeLog('2026-06-04T03:28:15.620801Z  INFO codex_tui: Goal hit usage limits (/goal resume)');
+      writeLog('2026-06-04T03:28:15.620801Z  INFO session_loop{thread_id=' + threadId + '}: codex_tui: Goal hit usage limits (/goal resume)');
     } else {
-      writeLog('2026-06-04T01:00:00Z ERROR session_loop: Turn error: workspace_owner_credits_depleted');
+      writeLog('2026-06-04T01:00:00Z ERROR session_loop{thread_id=' + threadId + '}: Turn error: workspace_owner_credits_depleted');
     }
     process.exit(0);
   }
@@ -240,12 +248,15 @@ for (const key of [
   "CX_NO_BYPASS",
   "CX_NO_TRUST",
   "CX_REAL_CODEX",
+  "CX_API_KEY_MODE",
 ]) {
   delete envBase[key];
 }
 delete envBase.CX_INTERACTIVE_AUTO_EXEC;
 
 function run(cmd, args, extraEnv = {}) {
+  // Filesystem fixtures use disposable homes; process guards have separate tests.
+  if (cmd === "cx-setup") args = ["--allow-active", ...args];
   return spawnSync(cmd, args, { cwd: root, env: { ...envBase, ...extraEnv }, encoding: "utf8" });
 }
 
@@ -282,7 +293,7 @@ function writeSharedSession(threadId, cwd = fs.realpathSync.native(root)) {
     JSON.stringify({
       timestamp: new Date().toISOString(),
       type: "session_meta",
-      payload: { id: threadId, cwd },
+      payload: { id: threadId, cwd, source: "cli" },
     }) + "\n",
   );
   sharedSessionMtimeCounter += 1;
@@ -328,7 +339,7 @@ function runVirtualE2e() {
   ok("cx-setup", ["--accounts", "4", "--full", "--migrate"]);
 
   let result = ok("cx", ["status"]);
-  assert.match(result.stderr, /account4\s+-\s+account\s+49%\s+credits depleted/);
+  assert.match(result.stderr, /account4\s+(?:-|unknown)\s+account\s+49%\s+credits depleted/);
 
   result = ok("cx", ["quota"]);
   assert.match(result.stderr, /Quota remaining:/);
@@ -347,7 +358,7 @@ function runVirtualE2e() {
     if (fs.existsSync("/proc")) {
       assert.match(result.stderr, /account2\s+yes/);
     } else {
-      assert.match(result.stderr, /account2\s+-\s+account/);
+      assert.match(result.stderr, /account2\s+unknown/);
     }
   } finally {
     holder.kill("SIGTERM");
@@ -396,6 +407,23 @@ function runVirtualE2e() {
     "non-retryable authentication failures should only be queried once per account",
   );
 
+  const refreshAuth = path.join(root, ".codex-account1", "auth.json");
+  const savedAuth = fs.readFileSync(refreshAuth, "utf8");
+  const expiredAuth = { tokens: { access_token: "e30." + Buffer.from(JSON.stringify({ exp: 1 })).toString("base64url") + ".sig", refresh_token: "fixture-refresh" } };
+  fs.writeFileSync(refreshAuth, JSON.stringify(expiredAuth));
+  clearRecords();
+  ok("cx", ["status"]);
+  let refreshes = readRecords().filter((entry) => entry.type === "account-read");
+  assert.equal(refreshes.length, 1);
+  assert.deepEqual(refreshes[0].params, { refreshToken: true });
+  assert.equal(readRecords().filter((entry) => entry.type === "limit-read" && entry.home.endsWith("account1")).length, 1);
+  clearRecords();
+  result = ok("cx", ["status"], { FAKE_REFRESH_ERROR: "1" });
+  assert.match(result.stderr, /token refresh failed/);
+  assert.equal(readRecords().filter((entry) => entry.type === "account-read").length, 1);
+  assert.equal(readRecords().filter((entry) => entry.type === "limit-read" && entry.home.endsWith("account1")).length, 0);
+  fs.writeFileSync(refreshAuth, savedAuth);
+
   result = ok("cx", ["--account", "4", "--dry-run", "--no-bypass", "exec", "hello"]);
   assert.match(result.stderr, /\.codex-account4/);
   assert.doesNotMatch(result.stderr, /dangerously-bypass/);
@@ -424,11 +452,15 @@ function runVirtualE2e() {
     "gpt-5.5",
     "--migrate",
   ]);
+  result = ok("cx", ["--account", "free", "--dry-run", "exec", "explicit API account"]);
+  assert.match(result.stderr, /codex-account-free/);
   result = ok("cxa", ["--dry-run", "exec", "default account first"]);
   assert.match(result.stderr, /selected account1 \(account1@example\.com\)/);
   result = ok("cxa", ["--dry-run", "exec", "api key first"], { CX_API_KEY_MODE: "prefer" });
   assert.match(result.stderr, /selected free \(api-key\)/);
-  result = ok("cxa", ["--dry-run", "exec", "fallback to api key"], { FAKE_LIMITS: exhaustedLimits });
+  result = run("cxa", ["--dry-run", "exec", "API disabled by default"], { FAKE_LIMITS: exhaustedLimits });
+  assert.equal(result.status, 1, result.stderr);
+  result = ok("cxa", ["--dry-run", "exec", "fallback to api key"], { FAKE_LIMITS: exhaustedLimits, CX_API_KEY_MODE: "fallback" });
   assert.match(result.stderr, /selected free \(api-key\)/);
   ok("cx-setup", ["--remove", "free"]);
   result = ok("cxa", ["--dry-run", "exec", "after remove"], { CX_API_KEY_MODE: "prefer" });
@@ -468,8 +500,16 @@ function runVirtualE2e() {
     }),
   });
   let goalSets = readRecords().filter((entry) => entry.type === "goal-set");
-  assert.equal(goalSets.length, 1, JSON.stringify(goalSets));
-  assert.deepEqual(goalSets[0].params, { threadId: pausedGoalThreadId, status: "active" });
+  assert.equal(goalSets.length, 0, "ordinary resume must preserve a paused goal");
+
+  assert.equal(readRecords().filter((entry) => entry.type === "goal-get").length, 0);
+  for (const status of ["paused", "blocked", "usageLimited"]) {
+    clearRecords();
+    ok("cx", ["--account", "1", "resume", pausedGoalThreadId], {
+      FAKE_GOALS: JSON.stringify({ ".codex-account1": { [pausedGoalThreadId]: status } }),
+    });
+    assert.equal(readRecords().filter((entry) => entry.type === "goal-get" || entry.type === "goal-set").length, 0);
+  }
 
   const disabledGoalThreadId = "019eaaaa-bbbb-7ccc-8ddd-ffffffffffff";
   const disabledGoalFile = writeSharedSession(disabledGoalThreadId);
@@ -582,20 +622,15 @@ function runVirtualE2e() {
   );
 
   clearRecords();
-  ok("cxa", ["resume", "--last"], {
+  result = run("cxa", ["resume", "--last"], {
     FAKE_LIMIT_ACCOUNT: ".codex-account1",
     FAKE_LIMIT_LOG: "out-of-credits",
     FAKE_LIMIT_SESSION: "no-id-usage-complete",
   });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /Cannot identify the interrupted thread/);
   runs = readRecords().filter((entry) => entry.type === "run");
-  assert.equal(runs.length, 2, JSON.stringify(runs));
-  assert.equal(path.basename(runs[1].home), ".codex-account3");
-  assert.deepEqual(
-    runs[1].args.slice(runs[1].args.findIndex((arg) => arg === "exec"), -1),
-    ["exec", "resume", "--last"],
-    "no-id interactive retries must use exec resume so Continue is not parsed as a session id",
-  );
-  assert.ok(runs[1].args.some((arg) => /Continue the interrupted task/.test(arg)));
+  assert.equal(runs.length, 1, "missing ID must stop before launching another account");
 
   const unsharedOne = path.join(root, "unshared-account1");
   const unsharedTwo = path.join(root, "unshared-account2");
@@ -622,6 +657,25 @@ function runVirtualE2e() {
     true,
     "the interrupted session should be copied into the next account home when sessions are not shared",
   );
+
+  for (const status of ["paused", "blocked", "usageLimited", "active", "complete"]) {
+    clearRecords();
+    ok("cxa", ["exec", "recover only a quota-stopped goal"], {
+      FAKE_LIMIT_ACCOUNT: ".codex-account1",
+      FAKE_GOALS: JSON.stringify({ ".codex-account3": { "019eaaaa-bbbb-7ccc-8ddd-000000000001": status } }),
+    });
+    const sets = readRecords().filter((entry) => entry.type === "goal-set");
+    assert.equal(sets.length, status === "usageLimited" ? 1 : 0, status);
+    if (sets.length) assert.deepEqual(sets[0].params, { threadId: "019eaaaa-bbbb-7ccc-8ddd-000000000001", status: "active" });
+  }
+
+  clearRecords();
+  ok("cxa", ["exec", "recovery disabled"], {
+    CX_AUTO_RESUME_GOAL: "0",
+    FAKE_LIMIT_ACCOUNT: ".codex-account1",
+    FAKE_GOALS: JSON.stringify({ ".codex-account3": { "019eaaaa-bbbb-7ccc-8ddd-000000000001": "usageLimited" } }),
+  });
+  assert.equal(readRecords().filter((entry) => entry.type === "goal-get" || entry.type === "goal-set").length, 0);
 
   clearRecords();
   ok("cxa", ["exec", "finish goal"], {

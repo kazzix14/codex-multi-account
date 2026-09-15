@@ -1,5 +1,8 @@
 "use strict";
 
+// These filesystem fixtures opt out of host process checks. security.test.js
+// separately verifies that real running Codex processes block setup by default.
+
 const assert = require("assert/strict");
 const fs = require("fs");
 const os = require("os");
@@ -125,7 +128,7 @@ assert.throws(
 {
   const setup = path.resolve(__dirname, "../bin/cx-setup");
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "cx-setup-empty-"));
-  const result = spawnSync(process.execPath, [setup, "--dry-run"], {
+  const result = spawnSync(process.execPath, [setup, "--allow-active", "--dry-run"], {
     env: cleanEnv({ HOME: tempHome }),
     encoding: "utf8",
   });
@@ -138,7 +141,7 @@ assert.throws(
 
 {
   const setup = path.resolve(__dirname, "../bin/cx-setup");
-  const result = spawnSync(process.execPath, [setup, "--help"], {
+  const result = spawnSync(process.execPath, [setup, "--allow-active", "--help"], {
     encoding: "utf8",
   });
 
@@ -156,7 +159,7 @@ assert.throws(
   const wrapperBin = path.join(tempHome, "bin");
   const result = spawnSync(
     process.execPath,
-    [setup, "--install-codex-wrapper", "--codex-wrapper-bin", wrapperBin, "--force"],
+    [setup, "--allow-active", "--install-codex-wrapper", "--codex-wrapper-bin", wrapperBin, "--force"],
     {
       env: cleanEnv({ HOME: tempHome }),
       encoding: "utf8",
@@ -199,22 +202,22 @@ assert.throws(
     ].join("\n"),
   );
 
-  const result = spawnSync(process.execPath, [setup, "--accounts", "2", "--migrate"], {
+  const result = spawnSync(process.execPath, [setup, "--allow-active", "--accounts", "2", "--migrate"], {
     env: cleanEnv({ HOME: tempHome }),
     encoding: "utf8",
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const syncedNotify = 'notify = ["terminal-notifier", "Codex # one"]';
+  const syncedNotify = ["terminal-notifier", "Codex # one"];
   const sharedConfig = fs.readFileSync(path.join(sharedHome, "config.toml"), "utf8");
   const accountOneConfig = fs.readFileSync(path.join(accountOne, "config.toml"), "utf8");
   const accountTwoConfig = fs.readFileSync(path.join(tempHome, ".codex-account2", "config.toml"), "utf8");
   assert.doesNotMatch(sharedConfig, /^notify\s*=/m);
   assert.match(sharedConfig, /^model = "gpt-shared"$/m);
   assert.match(sharedConfig, /^\[features\]$/m);
-  assert.match(accountOneConfig, new RegExp(`^${syncedNotify.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"));
+  assert.deepEqual(require("smol-toml").parse(accountOneConfig).notify, syncedNotify);
   assert.match(accountOneConfig, /^\[projects\./m);
-  assert.match(accountTwoConfig, new RegExp(`^${syncedNotify.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"));
+  assert.deepEqual(require("smol-toml").parse(accountTwoConfig).notify, syncedNotify);
   assert.match(result.stdout, /synced notify/);
   fs.rmSync(tempHome, { recursive: true, force: true });
 }
@@ -227,6 +230,7 @@ assert.throws(
     process.execPath,
     [
       setup,
+      "--allow-active",
       "--add-api-key",
       "free",
       "--api-key-env",
@@ -268,7 +272,7 @@ assert.throws(
   fs.mkdirSync(path.join(tempHome, ".codex-account-free"));
   fs.writeFileSync(path.join(tempHome, ".codex-account-free", "auth.json"), "{}\n");
 
-  const result = spawnSync(process.execPath, [setup, "--remove", "free"], {
+  const result = spawnSync(process.execPath, [setup, "--allow-active", "--remove", "free"], {
     env: cleanEnv({ HOME: tempHome }),
     encoding: "utf8",
   });
@@ -286,7 +290,7 @@ assert.throws(
   fs.mkdirSync(customHome);
   fs.writeFileSync(path.join(customHome, "auth.json"), "{}\n");
 
-  const result = spawnSync(process.execPath, [setup, "--homes", `work=${customHome}`, "--remove", "work"], {
+  const result = spawnSync(process.execPath, [setup, "--allow-active", "--homes", `work=${customHome}`, "--remove", "work"], {
     env: cleanEnv({ HOME: tempHome }),
     encoding: "utf8",
   });
@@ -304,7 +308,7 @@ assert.throws(
   fs.mkdirSync(path.join(tempHome, ".codex-account2"));
   fs.mkdirSync(path.join(tempHome, ".codex-account-free"));
 
-  const result = spawnSync(process.execPath, [setup, "--accounts", "1", "--prune", "--migrate"], {
+  const result = spawnSync(process.execPath, [setup, "--allow-active", "--accounts", "1", "--prune", "--migrate"], {
     env: cleanEnv({ HOME: tempHome }),
     encoding: "utf8",
   });
@@ -329,7 +333,7 @@ assert.throws(
     `${JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: "sk-backup" })}\n`,
   );
 
-  const result = spawnSync(process.execPath, [setup, "--list"], {
+  const result = spawnSync(process.execPath, [setup, "--allow-active", "--list"], {
     env: cleanEnv({ HOME: tempHome }),
     encoding: "utf8",
   });
@@ -347,7 +351,7 @@ assert.throws(
   fs.mkdirSync(path.join(tempHome, ".codex-account4"));
   fs.mkdirSync(path.join(tempHome, ".codex-account7"));
 
-  const result = spawnSync(process.execPath, [setup, "--dry-run"], {
+  const result = spawnSync(process.execPath, [setup, "--allow-active", "--dry-run"], {
     env: cleanEnv({ HOME: tempHome }),
     encoding: "utf8",
   });
@@ -362,7 +366,7 @@ assert.throws(
 {
   const setup = path.resolve(__dirname, "../bin/cx-setup");
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "cx-setup-duplicate-name-"));
-  const result = spawnSync(process.execPath, [setup, "--homes", `work=${tempHome}/a,WORK=${tempHome}/b`, "--dry-run"], {
+  const result = spawnSync(process.execPath, [setup, "--allow-active", "--homes", `work=${tempHome}/a,WORK=${tempHome}/b`, "--dry-run"], {
     env: cleanEnv({ HOME: tempHome }),
     encoding: "utf8",
   });
@@ -375,7 +379,7 @@ assert.throws(
 {
   const setup = path.resolve(__dirname, "../bin/cx-setup");
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "cx-setup-duplicate-home-"));
-  const result = spawnSync(process.execPath, [setup, "--homes", `work=${tempHome}/a,backup=${tempHome}/a`, "--dry-run"], {
+  const result = spawnSync(process.execPath, [setup, "--allow-active", "--homes", `work=${tempHome}/a,backup=${tempHome}/a`, "--dry-run"], {
     env: cleanEnv({ HOME: tempHome }),
     encoding: "utf8",
   });
@@ -389,7 +393,7 @@ assert.throws(
   const setup = path.resolve(__dirname, "../bin/cx-setup");
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "cx-setup-shared-home-"));
   const sharedHome = path.join(tempHome, ".codex-shared");
-  const result = spawnSync(process.execPath, [setup, "--homes", `work=${sharedHome}`, "--home", sharedHome, "--dry-run"], {
+  const result = spawnSync(process.execPath, [setup, "--allow-active", "--homes", `work=${sharedHome}`, "--home", sharedHome, "--dry-run"], {
     env: cleanEnv({ HOME: tempHome }),
     encoding: "utf8",
   });
@@ -408,7 +412,7 @@ assert.throws(
   fs.writeFileSync(sessionFile, "session data\n");
   fs.writeFileSync(path.join(accountOne, "auth.json"), "{}\n");
 
-  const args = [setup, "--accounts", "2", "--migrate"];
+  const args = [setup, "--allow-active", "--accounts", "2", "--migrate"];
   const first = spawnSync(process.execPath, args, {
     env: cleanEnv({ HOME: tempHome }),
     encoding: "utf8",

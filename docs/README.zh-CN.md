@@ -41,13 +41,13 @@ codex --version
 ## 安装
 
 ```sh
-npm install -g github:rmqg/codex-multi-account
+npm install -g github:kazzix14/codex-multi-account
 ```
 
 以后升级也运行同一条命令：
 
 ```sh
-npm install -g github:rmqg/codex-multi-account
+npm install -g github:kazzix14/codex-multi-account
 ```
 
 安装后确认命令存在：
@@ -250,6 +250,7 @@ models_cache.json
   用户级配置的顶层项，会复制到每个选中的账号 `config.toml`，然后从共享文件
   移除。这样 `~/.codex/config.toml` 被 Codex 当作项目本地 `.codex` 层读取时，
   不会再触发启动告警。
+- 多行数组和字符串按完整 TOML 值解析。修改目录前验证所有配置输出；原文件保存为权限 `0600` 的 `config.toml.cx-backup-*`，配置写入失败时恢复已写文件。无关设置和注释保留；无效 TOML 和软链配置会被拒绝。备份保留供恢复使用；整个目录迁移并非原子事务。
 
 如果你还想共享日志、goals、state、memories sqlite 文件：
 
@@ -257,11 +258,11 @@ models_cache.json
 cx-setup --accounts 3 --full --migrate
 ```
 
-`--full` 更激进，不建议同时开多个会写 state 的 Codex 实例。
+setup、移除、prune 和 `--full` 迁移前，请退出 Codex 会话和 app-server。Linux 检查显式和默认 home，也检查其他运行账号引用的共享状态。macOS 的 `ps` 无法可靠区分每个进程的 home，因此检测到任何 Codex 进程时保守地停止修改。无法读取进程状态时也会停止。`--allow-active` 是显式承担风险的覆盖选项，仅在相关状态空闲时使用。检查无法阻止其他进程在检查后启动。`--full` 共享 SQLite/WAL，并不保证并发写入安全。
 
 ## API key 账号
 
-你也可以创建一个 API key 账号作为兜底。
+你可以创建 API key 账号；创建账号不会自动启用 API 切换。
 
 推荐从环境变量读取 key：
 
@@ -277,8 +278,13 @@ printf '%s' "$OPENAI_API_KEY" | cx-setup --add-api-key free --api-key-stdin --op
 
 默认选择策略是：
 
-- 先用正常 ChatGPT/Codex 账号。
-- 这些账号不可用或额度耗尽时，再用 API key 账号。
+- `off`（默认）：自动选择只使用 ChatGPT/Codex 账号；仍可用 `cx --account <name>` 显式选择 API 账号。
+- `fallback`：显式允许订阅账号不可用或额度耗尽时使用 API 账号。
+- `prefer`：显式优先使用 API 账号。
+
+`CX_API_KEY_MODE=fallback cxa` 仅对本次运行启用兜底；`cx-setup --api-key-mode fallback` 保存偏好，`cx-setup --api-key-mode off` 关闭。之前显式保存的 `fallback` / `prefer` 偏好会保留。
+
+启用 API 自动选择可能产生费用，并把恢复的会话发送给该账号配置的 provider，包括自定义 `openai_base_url`。API 额度条是占位值，不代表实际余额；cx 没有金额上限控制。请在 provider 端设置预算，并用 `CX_ACCOUNT_HOMES=name=/path,...` 限定允许的目标账号。
 
 如果想优先用 API key 账号：
 
@@ -369,7 +375,7 @@ CX_INTERACTIVE_AUTO_EXEC=1
 
 `CX_LIMIT_TIMEOUT_MS` 控制单次额度探测的超时时间，`CX_LIMIT_RETRIES` 控制每个账号最多尝试几次，`CX_LIMIT_RETRY_DELAY_MS` 控制失败后再试前等待多久。
 
-每个 ChatGPT 账号的探测都会在线读取服务端当前的周限额，`cx` 不会使用本地额度缓存选号。网络超时和临时服务错误仍会按配置重试；本地访问令牌已经过期，或服务端明确返回 401/403 等不可重试认证错误时，会立即停止该账号的重复探测，以免相同错误拖慢 `cx` 启动。
+每次 ChatGPT 额度探测都读取服务端当前数据。网络超时和临时错误按设置重试。访问 token 过期且存在 refresh token 时，通过官方 `account/read {refreshToken:true}` 尝试刷新一次；刷新失败、缺少 refresh token 或 401/403 等认证错误会停止该账号的探测。认证文件不会在账号之间复制。
 
 ## 自动切号怎么继续任务
 
@@ -388,7 +394,15 @@ codex resume <interrupted-session-id> "Continue the interrupted task ..."
 codex exec resume <interrupted-session-id> "Continue the interrupted task ..."
 ```
 
-如果没有找到精确 session id，`cx` 会尽量使用安全的 fallback，避免把 `Continue ...` 错当成 session id。
+本次运行的独立日志中，额度错误必须包含有效的 `session_loop{thread_id=<UUID>}`。cx 只读取该 ID 对应的最新内容，校验工作目录，并将名称或 `--last` 转为精确 ID。ID 缺失、冲突、记录过旧或损坏时停止自动切换，请手动恢复目标会话。同一项目里较新的其他会话也不会被选中。Codex 日志格式变化可能导致自动切换安全停止。只接受来源为顶层 `cli` / `exec` 的记录；子代理和未知来源会被拒绝，避免把子代理的额度错误误认为主会话。
+
+不同账号不共享 sessions 时，以 `0600` 权限复制对应记录。目标副本过旧、冲突或复制失败时停止，不静默覆盖。复制记录无法迁移全部 Codex 状态，例如独立的 goal 数据库。
+
+先发送 SIGTERM，三秒内未退出再发送 SIGKILL；旧进程退出后才启动新账号。可选 PATH 包装器先给其子进程两秒退出时间。Codex 自身负责工具子进程的清理。
+
+普通 `resume` 不读取或改变 goal 状态。只有本次额度错误触发的切换，才会恢复对应线程的 `usageLimited` goal；`paused`、`blocked` 等状态保持不变。`CX_AUTO_RESUME_GOAL=0` 可关闭恢复。
+
+本次修复按要求保留既有的审批/沙箱 bypass 和项目自动信任行为。详见 [安全修复记录](SECURITY-FIXES.md)。
 
 ## 常见问题
 
@@ -408,9 +422,9 @@ cx-setup --accounts 3 --migrate
 CODEX_HOME="$HOME/.codex-accountN" codex login
 ```
 
-`access token expired`
+`access token expired` / `token refresh failed`
 
-该账号的登录令牌已经过期，重新登录后才能取得最新周限额：
+访问 token 已过期，且缺少 refresh token 或刷新失败。请重新登录：
 
 ```sh
 CODEX_HOME="$HOME/.codex-accountN" codex login
@@ -441,7 +455,7 @@ cx-setup --install-codex-wrapper --force
 
 `cx status` 不显示 active
 
-active 检测依赖 Linux `/proc`，在非 Linux 环境可能不准确。
+Linux 使用 `/proc`，macOS 使用 `ps`。无法可靠识别 home 时显示 `unknown`，选择账号时保守处理，setup 则停止修改。macOS 上执行 setup 前请退出所有 Codex 会话和 app-server。
 
 API key 校验失败
 

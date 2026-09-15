@@ -5,6 +5,8 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { createHash } = require("crypto");
+const { canonical, inspectCodexProcesses, stopChild } = require("../lib/processes");
 
 const home = os.homedir();
 const packageVersion = readPackageVersion();
@@ -24,7 +26,7 @@ const rateLimitTextPattern =
 const rateLimitReasonPattern =
   /(?:You've hit your usage limit|You've reached your usage limit|Usage limit reached|Your workspace is out of credits|You're out of credits|You exceeded your current quota|insufficient_quota|requires_payment_method|workspace_(?:owner|member)_(?:credits_depleted|usage_limit_reached)|\bcredits_depleted\b|\brate_limit_reached\b|You hit your spend cap)/i;
 const turnErrorRateLimitPattern = new RegExp(`\\bTurn error:.*${rateLimitReasonPattern.source}`, "i");
-const turnErrorHttpRateLimitPattern = /\bTurn error:.*(?:429|Too Many Requests|HTTP status client error)/i;
+const turnErrorHttpRateLimitPattern = /\bTurn error:\s*(?:unexpected status\s+429\b|HTTP status client error\s*\(429\b|(?:HTTP(?:\/\d(?:\.\d)?)?\s+)?429\s+Too Many Requests\b|Too Many Requests\b)/i;
 const structuredGoalUsageLimitPattern =
   /^(?:\d{4}-\d{2}-\d{2}T.*\b(?:INFO|WARN|ERROR)\b.*|(?:INFO|WARN|ERROR):?\s+.*)Goal hit usage limits\b/i;
 const rateLimitUiPattern =
@@ -32,7 +34,7 @@ const rateLimitUiPattern =
 const nonAccountRateLimitPattern =
   /(?:codex_core_plugins::startup_sync|GitHub HTTP sync failed|curated plugin sync|api\.github\.com\/repos\/openai\/plugins|github\.com\/openai\/plugins(?:\.git)?|docs\.github\.com\/en\/site-policy\/github-terms|You have exceeded a secondary rate limit)/i;
 const logLevelLinePattern = /^(?:\d{4}-\d{2}-\d{2}T.*\b(?:INFO|WARN|ERROR)\b.*|(?:INFO|WARN|ERROR):?\b.*)/i;
-const apiKeyModes = new Set(["prefer", "fallback"]);
+const apiKeyModes = new Set(["off", "prefer", "fallback"]);
 const continuationPrompt =
   "Continue the interrupted task from the last user instruction in this session. " +
   "The previous account hit a usage limit before completing the turn; do not ask the user to repeat it.";
@@ -129,6 +131,7 @@ const execResumeSupportedOptions = new Set([
 ]);
 
 let activeChild = null;
+const rpcChildren = new Set();
 let defaultAccountsCache = null;
 let runtimeConfigCache = null;
 let terminating = false;
@@ -167,8 +170,8 @@ Environment:
   CX_NO_BYPASS=1                                Do not add the bypass flag.
   CX_NO_TRUST=1                                 Do not write project trust for the current workdir.
   CX_COLOR=1|0                                  Force-enable or disable quota colors.
-  CX_AUTO_RESUME_GOAL=0                         Do not reactivate paused/limited goals before resume.
-  CX_API_KEY_MODE=prefer|fallback               API-key account selection mode. Default: fallback.
+  CX_AUTO_RESUME_GOAL=0                         Disable quota-stopped goal recovery during handoff.
+  CX_API_KEY_MODE=off|prefer|fallback           API-key auto-selection. Default: off; enabling may incur charges.
   CX_LIMIT_TIMEOUT_MS=30000                     Rate-limit probe timeout.
   CX_LIMIT_RETRIES=3                            Rate-limit probe attempts per account.
   CX_LIMIT_RETRY_DELAY_MS=1500                  Delay before retrying a failed probe.
@@ -287,7 +290,7 @@ function getRuntimeConfig() {
       limitRetries: parsePositiveInteger(process.env.CX_LIMIT_RETRIES, 3, "CX_LIMIT_RETRIES"),
       limitRetryDelayMs: parsePositiveInteger(process.env.CX_LIMIT_RETRY_DELAY_MS, 1500, "CX_LIMIT_RETRY_DELAY_MS"),
       autoMaxSwitches: parsePositiveInteger(process.env.CX_AUTO_MAX_SWITCHES, 5, "CX_AUTO_MAX_SWITCHES"),
-      apiKeyMode: normalizeApiKeyMode(process.env.CX_API_KEY_MODE || localConfig.apiKeyMode || "fallback", "CX_API_KEY_MODE"),
+      apiKeyMode: normalizeApiKeyMode(process.env.CX_API_KEY_MODE || localConfig.apiKeyMode || "off", "CX_API_KEY_MODE"),
     };
   }
   return runtimeConfigCache;
@@ -404,7 +407,7 @@ function normalizeApiKeyMode(value, label = "api key mode") {
     return "fallback";
   }
   if (!apiKeyModes.has(normalized)) {
-    const error = new Error(`${label} must be prefer or fallback`);
+    const error = new Error(`${label} must be off, prefer or fallback`);
     error.exitCode = 2;
     throw error;
   }
@@ -749,12 +752,15 @@ async function readRateLimits(account, options = {}) {
   }
 
   if (accountAccessTokenExpired(auth)) {
-    return Promise.resolve({
-      account,
-      ok: false,
-      authMode: "account",
-      error: `access token expired; run CODEX_HOME=${account.home} codex login`,
-    });
+    if (!auth.tokens?.refresh_token) {
+      return { account, ok: false, authMode: "account", error: `access token expired; run CODEX_HOME=${account.home} codex login` };
+    }
+    try {
+      const refreshed = await appServerRequest(account.home, "account/read", { refreshToken: true });
+      if (!refreshed?.account) throw new Error("Codex returned no authenticated account");
+    } catch {
+      return { account, ok: false, authMode: "account", error: `token refresh failed; run CODEX_HOME=${account.home} codex login` };
+    }
   }
 
   const runtimeConfig = getRuntimeConfig();
@@ -780,6 +786,7 @@ async function readRateLimits(account, options = {}) {
 
 function appServerRequest(accountHome, method, params, options = {}) {
   return new Promise((resolve, reject) => {
+    if (terminating) { reject(new Error("Interrupted")); return; }
     const timeoutMs = options.timeoutMs || getRuntimeConfig().timeoutMs;
 
     const env = { ...process.env, CODEX_HOME: accountHome, CODEX_TRUST_ALL: "0" };
@@ -789,6 +796,9 @@ function appServerRequest(accountHome, method, params, options = {}) {
       env,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    rpcChildren.add(child);
+    child.once("exit", () => rpcChildren.delete(child));
+    child.once("error", () => rpcChildren.delete(child));
 
     let buffer = "";
     let stderr = "";
@@ -798,15 +808,13 @@ function appServerRequest(accountHome, method, params, options = {}) {
       finish(new Error(`timeout after ${timeoutMs}ms`));
     }, timeoutMs);
 
-    function finish(error, result) {
+    async function finish(error, result) {
       if (settled) {
         return;
       }
       settled = true;
       clearTimeout(timer);
-      if (!child.killed) {
-        child.kill("SIGTERM");
-      }
+      await stopChild(child);
       if (error) {
         reject(error);
       } else {
@@ -831,7 +839,7 @@ function appServerRequest(accountHome, method, params, options = {}) {
       }
     });
     child.on("exit", (code) => {
-      if (!settled && code !== 0) {
+      if (!settled) {
         finish(new Error(stderr.trim() || `codex app-server exited ${code}`));
       }
     });
@@ -1132,38 +1140,11 @@ function isApiKeyResult(result) {
 }
 
 function getProcessActiveAccountNames() {
-  const names = new Set();
-  const accounts = getDefaultAccounts();
-  let pids;
-  try {
-    pids = fs.readdirSync("/proc").filter((entry) => /^\d+$/.test(entry));
-  } catch {
-    return names;
-  }
-
-  for (const pid of pids) {
-    try {
-      const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean);
-      const command = cmdline.join(" ");
-      if (!command.includes("codex") || command.includes("app-server")) {
-        continue;
-      }
-      const environ = fs.readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").filter(Boolean);
-      const codexHome = environ
-        .map((entry) => entry.match(/^CODEX_HOME=(.*)$/))
-        .find(Boolean)?.[1];
-      if (!codexHome) {
-        continue;
-      }
-      const account = accounts.find((candidate) => path.resolve(candidate.home) === path.resolve(codexHome));
-      if (account) {
-        names.add(account.name);
-      }
-    } catch {
-      // Processes can exit while we scan /proc.
-    }
-  }
-
+  const inspection = inspectCodexProcesses();
+  const names = new Set(getDefaultAccounts()
+    .filter((account) => inspection.unknown || inspection.homes.has(canonical(account.home)))
+    .map((account) => account.name));
+  names.unknown = inspection.unknown;
   return names;
 }
 
@@ -1383,7 +1364,7 @@ function printStatus(results) {
   console.error("Account   active   auth      weekly used   reached   home");
   for (const result of results.slice().sort((a, b) => compareAccountResults(a, b, { apiKeyMode }))) {
     const limit = result.limits;
-    const active = result.active ? "yes" : "-";
+    const active = result.activeUnknown ? "unknown" : result.active ? "yes" : "-";
     const auth = result.authMode === "apikey" ? "api-key" : result.authMode === "account" ? "account" : "-";
     const weekly = result.ok ? formatOptionalPercent(usedPercent(limit)) : "ERR";
     const hit = limitExhaustedReason(result) || "-";
@@ -1546,7 +1527,8 @@ function baseGlobalArgs(options, codexArgs, extraGlobalArgs = []) {
 
 function selectResult(results, options = {}) {
   const apiKeyMode = options.apiKeyMode || getRuntimeConfig().apiKeyMode;
-  return results.slice().sort((a, b) => compareAccountResults(a, b, { apiKeyMode })).find(isUsable) || null;
+  return results.filter((result) => apiKeyMode !== "off" || !isApiKeyResult(result))
+    .sort((a, b) => compareAccountResults(a, b, { apiKeyMode })).find(isUsable) || null;
 }
 
 function optionName(arg) {
@@ -2014,56 +1996,6 @@ function analyzeCodexArgs(args) {
   };
 }
 
-function findLatestSessionFile(accountHome, options = {}) {
-  const root = path.join(accountHome, "sessions");
-  const minMtimeMs = options.minMtimeMs || 0;
-  const cwd = options.cwd ? path.resolve(options.cwd) : null;
-  const stack = [root];
-  let latest = null;
-
-  while (stack.length > 0) {
-    const current = stack.pop();
-    let entries;
-    try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    for (const entry of entries) {
-      const target = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(target);
-        continue;
-      }
-      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) {
-        continue;
-      }
-
-      let stat;
-      try {
-        stat = fs.statSync(target);
-      } catch {
-        continue;
-      }
-      if (stat.mtimeMs < minMtimeMs) {
-        continue;
-      }
-      if (!latest || stat.mtimeMs > latest.mtimeMs) {
-        if (cwd) {
-          const meta = readSessionMeta(target);
-          if (!meta.cwd || path.resolve(meta.cwd) !== cwd) {
-            continue;
-          }
-        }
-        latest = { file: target, mtimeMs: stat.mtimeMs };
-      }
-    }
-  }
-
-  return latest?.file || null;
-}
-
 function readSessionMeta(file) {
   let fd;
   try {
@@ -2097,11 +2029,26 @@ function readSessionMeta(file) {
   }
 }
 
-function sessionIdFromFileName(file) {
-  const match = path
-    .basename(file || "")
-    .match(/(?:^|-)rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
-  return match?.[1] || null;
+function findSessionFileById(accountHome, threadId, options = {}) {
+  if (!isUuidLike(threadId)) return null;
+  const stack = [path.join(accountHome, "sessions")];
+  const matches = [];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (error) { if (error.code === "ENOENT") continue; throw error; }
+    for (const entry of entries) {
+      const file = path.join(dir, entry.name);
+      const filenameId = entry.name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)?.[1];
+      if (entry.isDirectory()) stack.push(file);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl") && (!filenameId || filenameId === threadId) && readSessionMeta(file).id === threadId) matches.push(file);
+    }
+  }
+  if (matches.length > 1) throw new Error("Multiple transcripts for interrupted thread; refusing automatic handoff");
+  const file = matches[0];
+  if (!file || fs.statSync(file).mtimeMs < (options.minMtimeMs || 0)) return null;
+  return file;
 }
 
 function tokenCountHasUsageLimit(payload) {
@@ -2118,8 +2065,8 @@ function tokenCountHasUsageLimit(payload) {
   return false;
 }
 
-function latestSessionTurnState(accountHome, options = {}) {
-  const file = findLatestSessionFile(accountHome, options);
+function readSessionTurnState(accountHome, options = {}) {
+  const file = findSessionFileById(accountHome, options.threadId, options);
   if (!file) {
     return { file: null, incomplete: false };
   }
@@ -2127,7 +2074,7 @@ function latestSessionTurnState(accountHome, options = {}) {
 
   const state = {
     file,
-    sessionId: meta.id || sessionIdFromFileName(file) || null,
+    sessionId: meta.id,
     cwd: meta.cwd || null,
     activeTurn: false,
     sawUser: false,
@@ -2144,8 +2091,22 @@ function latestSessionTurnState(accountHome, options = {}) {
 
   let lines;
   try {
-    lines = fs.readFileSync(file, "utf8").trimEnd().split("\n");
-  } catch {
+    const content = fs.readFileSync(file);
+    state.digest = createHash("sha256").update(content).digest("hex");
+    lines = content.toString("utf8").trimEnd().split("\n");
+    const header = JSON.parse(lines[0]);
+    if (header.type !== "session_meta" || header.payload?.id !== options.threadId) {
+      throw new Error("Transcript identity changed");
+    }
+    // Subagents can log their own quota errors into the same process log.
+    // Never promote a subordinate conversation into the user's main task.
+    if (!["cli", "exec"].includes(header.payload.source)) {
+      throw new Error("Transcript is not a known top-level CLI session");
+    }
+    state.sessionId = header.payload.id;
+    state.cwd = header.payload.cwd;
+  } catch (error) {
+    if (options.threadId) throw new Error("Cannot read interrupted transcript; refusing automatic handoff");
     return { file, incomplete: false };
   }
 
@@ -2158,6 +2119,7 @@ function latestSessionTurnState(accountHome, options = {}) {
     try {
       event = JSON.parse(line);
     } catch {
+      if (options.threadId) throw new Error("Incomplete or corrupt interrupted transcript; refusing automatic handoff");
       continue;
     }
 
@@ -2224,16 +2186,6 @@ function latestSessionTurnState(accountHome, options = {}) {
 }
 
 function retryTargetFromSession(analysis, sessionState) {
-  if (!sessionState.sessionId) {
-    return analysis;
-  }
-
-  const targetArgs = analysis.resumeTargetArgs || ["--last"];
-  const currentTarget = targetArgs[0];
-  if (currentTarget && currentTarget !== "--last") {
-    return analysis;
-  }
-
   return { ...analysis, resumeTargetArgs: [sessionState.sessionId] };
 }
 
@@ -2279,29 +2231,43 @@ function retrySessionFromState(accountHome, sessionState) {
     sourceHome: accountHome,
     file: sessionState.file,
     relativePath,
-    sessionId: sessionState.sessionId || null,
+    sessionId: sessionState.sessionId,
+    digest: sessionState.digest,
+    quotaStopped: true,
   };
 }
 
+function sessionDigest(file) {
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
 function ensureRetrySessionAvailable(retrySession, account) {
-  if (!retrySession?.file || !retrySession.relativePath) {
-    return;
+  if (!retrySession) return;
+  if (!isUuidLike(retrySession.sessionId) || !retrySession.relativePath ||
+      sessionRelativePath(retrySession.sourceHome, retrySession.file) !== retrySession.relativePath ||
+      readSessionMeta(retrySession.file).id !== retrySession.sessionId ||
+      sessionDigest(retrySession.file) !== retrySession.digest) {
+    throw new Error("Interrupted session changed or is invalid; refusing automatic handoff");
   }
-
-  const targetFile = path.join(account.home, "sessions", retrySession.relativePath);
-  if (fs.existsSync(targetFile)) {
-    return;
-  }
-
-  try {
-    fs.mkdirSync(path.dirname(targetFile), { recursive: true });
-    fs.copyFileSync(retrySession.file, targetFile, fs.constants.COPYFILE_EXCL);
-    console.error(`[cx-auto] copied interrupted session to ${account.name}.`);
-  } catch (error) {
-    if (fs.existsSync(targetFile)) {
-      return;
+  const root = path.join(account.home, "sessions");
+  const existing = findSessionFileById(account.home, retrySession.sessionId);
+  const targetFile = existing || path.join(root, retrySession.relativePath);
+  if (!fs.existsSync(targetFile)) {
+    fs.mkdirSync(path.dirname(targetFile), { recursive: true, mode: 0o700 });
+    const parent = canonical(path.dirname(targetFile));
+    if (parent !== canonical(root) && !parent.startsWith(canonical(root) + path.sep)) {
+      throw new Error("Session destination escapes the sessions directory");
     }
-    console.error(`[cx-auto] session sync failed for ${account.name}: ${error.message}`);
+    const fd = fs.openSync(targetFile, "wx", 0o600);
+    try { fs.writeFileSync(fd, fs.readFileSync(retrySession.file)); }
+    finally { fs.closeSync(fd); }
+    console.error(`[cx-auto] copied interrupted session to ${account.name}.`);
+  }
+  if (fs.lstatSync(targetFile).isSymbolicLink() ||
+      readSessionMeta(targetFile).id !== retrySession.sessionId ||
+      sessionDigest(targetFile) !== retrySession.digest ||
+      sessionDigest(retrySession.file) !== retrySession.digest) {
+    throw new Error("Session sync failed: destination is stale, conflicting, or changed; refusing automatic handoff");
   }
 }
 
@@ -2315,11 +2281,6 @@ function execResumeArgsFromInteractiveAnalysis(analysis, prompt) {
     ...(analysis.resumeTargetArgs || ["--last"]),
     ...(prompt ? [prompt] : []),
   ];
-}
-
-function interactiveResumePromptNeedsExecFallback(analysis, prompt) {
-  const targetArgs = analysis.resumeTargetArgs || ["--last"];
-  return Boolean(prompt && analysis.mode === "interactive" && targetArgs[0] === "--last");
 }
 
 function cwdFromGlobalArgs(globalArgs) {
@@ -2345,30 +2306,22 @@ function isUuidLike(value) {
 }
 
 function resolveResumeThreadId(accountHome, analysis) {
-  const targetArgs = analysis.resumeTargetArgs || ["--last"];
-  const target = targetArgs[0];
-  if (target && target !== "--last") {
-    return isUuidLike(target) ? target : null;
-  }
-
-  const file = findLatestSessionFile(accountHome, {
-    cwd: hasOption(analysis.resumeOptions || [], "--all") ? null : cwdFromGlobalArgs(analysis.globalArgs || []),
-  });
-  return file ? readSessionMeta(file).id || null : null;
+  const target = analysis.resumeTargetArgs?.[0];
+  return isUuidLike(target) ? target : null;
 }
 
 function shouldResumeGoalStatus(status) {
-  return status === "paused" || status === "usageLimited" || status === "blocked";
+  return status === "usageLimited";
 }
 
-async function resumeGoalIfNeeded(account, codexArgs) {
-  if (process.env.CX_AUTO_RESUME_GOAL === "0" || !isResumeInvocation(codexArgs)) {
+async function resumeGoalIfNeeded(account, codexArgs, retrySession = null) {
+  if (!retrySession?.quotaStopped || process.env.CX_AUTO_RESUME_GOAL === "0" || !isResumeInvocation(codexArgs)) {
     return;
   }
 
   const analysis = analyzeCodexArgs(codexArgs);
   const threadId = resolveResumeThreadId(account.home, analysis);
-  if (!threadId) {
+  if (!threadId || threadId !== retrySession.sessionId) {
     return;
   }
 
@@ -2395,14 +2348,24 @@ async function resumeGoalIfNeeded(account, codexArgs) {
 
 function retryPlanAfterRateLimit(previousArgs, accountHome, options = {}) {
   const analysis = analyzeCodexArgs(previousArgs);
-  const sessionState = latestSessionTurnState(accountHome, {
+  if (!isUuidLike(options.threadId)) {
+    throw new Error("Cannot identify the interrupted thread from this Codex run; refusing automatic handoff. Resume the intended thread manually.");
+  }
+  const explicitTarget = isResumeInvocation(previousArgs) ? analysis.resumeTargetArgs?.[0] : null;
+  if (isUuidLike(explicitTarget) && explicitTarget !== options.threadId) {
+    throw new Error("Interrupted thread does not match the requested resume ID; refusing automatic handoff");
+  }
+  const sessionState = readSessionTurnState(accountHome, {
     ...options,
     assumeUsageLimited: true,
     initialTaskFastMode: taskFastModeFromArgs(previousArgs),
   });
 
   if (!sessionState.file) {
-    return { args: [...previousArgs], session: null };
+    throw new Error("No fresh transcript for the interrupted thread; refusing automatic handoff");
+  }
+  if (!sessionState.cwd || canonical(sessionState.cwd) !== canonical(cwdFromGlobalArgs(analysis.globalArgs))) {
+    throw new Error("Interrupted thread belongs to a different working directory; refusing automatic handoff");
   }
 
   const retryAnalysis = retryTargetFromSession(analysis, sessionState);
@@ -2412,14 +2375,11 @@ function retryPlanAfterRateLimit(previousArgs, accountHome, options = {}) {
     prompt = continuationPrompt;
     if (
       retryAnalysis.mode === "interactive" &&
-      (process.env.CX_INTERACTIVE_AUTO_EXEC === "1" || interactiveResumePromptNeedsExecFallback(retryAnalysis, prompt))
+      process.env.CX_INTERACTIVE_AUTO_EXEC === "1"
     ) {
       return { args: applySessionTaskState(execResumeArgsFromInteractiveAnalysis(retryAnalysis, prompt), sessionState), session: retrySession };
     }
   } else if (!sessionState.completed && analysis.prompt) {
-    if (analysis.mode === "interactive") {
-      return { args: applySessionTaskState([...previousArgs], sessionState), session: retrySession };
-    }
     prompt = analysis.prompt;
   }
 
@@ -2436,6 +2396,7 @@ async function probeAccounts(excludedNames = new Set(), options = {}) {
   const results = await Promise.all(accounts.map((account) => readRateLimits(account)));
   for (const result of results) {
     result.active = activeNames.has(result.account.name);
+    result.activeUnknown = Boolean(activeNames.unknown);
   }
   return results;
 }
@@ -2443,6 +2404,9 @@ async function probeAccounts(excludedNames = new Set(), options = {}) {
 function describeSelection(result, prefix = "cx-auto") {
   const limit = result.limits;
   const auth = result.authMode === "apikey" ? "api-key" : "account";
+  if (result.authMode === "apikey") {
+    console.error("[cx-auto] API-key use was explicitly enabled. Requests may incur charges and use this account's configured provider; cx does not enforce a spending cap.");
+  }
   console.error(
     `[${prefix}] selected ${accountDisplayName(result.account)} [${auth}]: weekly used ${formatOptionalPercent(usedPercent(limit))}`,
   );
@@ -2459,9 +2423,8 @@ function installSignalForwarding() {
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => {
       terminating = true;
-      if (activeChild && !activeChild.killed) {
-        activeChild.kill(signal);
-      }
+      if (activeChild) void stopChild(activeChild, signal);
+      for (const child of rpcChildren) void stopChild(child, signal);
     });
   }
 }
@@ -2517,6 +2480,7 @@ function runCodex(account, commandArgs) {
 
     const child = spawn("codex", commandArgs, { env, stdio: "inherit" });
     activeChild = child;
+    child.on("error", () => { activeChild = null; resolve({ code: 127 }); });
     child.on("exit", (code, signal) => {
       activeChild = null;
       resolve({ code, signal });
@@ -2524,79 +2488,72 @@ function runCodex(account, commandArgs) {
   });
 }
 
+function usageLimitThreadId(line) {
+  if (!isUsageLimitLogLine(line) || !logLevelLinePattern.test(line)) return null;
+  const match = line.match(/\bsession_loop\{[^}]*\bthread_id=([0-9a-f-]{36})(?=[\s}])/i);
+  return match && isUuidLike(match[1]) ? match[1] : null;
+}
+
 function runCodexMonitored(account, commandArgs, logDir) {
   return new Promise((resolve) => {
     const env = { ...process.env, CODEX_HOME: account.home, CODEX_TRUST_ALL: "0" };
     delete env.CODEX_THREAD_ID;
-
     const child = spawn("codex", commandArgs, { env, stdio: "inherit" });
     activeChild = child;
-
     const logFile = path.join(logDir, "codex-tui.log");
     let offset = 0;
-    let pendingLogLine = "";
+    let pending = "";
     let rateLimited = false;
-    let settled = false;
+    let threadId = null;
+    let identityMissing = false;
+    let shutdown = null;
 
-    function finish(result) {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearInterval(timer);
-      activeChild = null;
-      resolve(result);
+    function consume(line) {
+      if (!isUsageLimitLogLine(line)) return;
+      const id = usageLimitThreadId(line);
+      if (!id || (threadId && id !== threadId)) identityMissing = true;
+      if (id) threadId = id;
+      if (rateLimited) return;
+      rateLimited = true;
+      console.error("\n[cx-auto] usage limit detected; stopping Codex before handoff...");
+      shutdown = stopChild(child);
     }
 
-    function scanLog() {
+    function scanLog(final = false) {
       try {
-        const stat = fs.statSync(logFile);
-        if (stat.size <= offset) {
-          return;
-        }
+        const size = fs.statSync(logFile).size;
+        if (size < offset) { identityMissing = true; offset = 0; }
         const fd = fs.openSync(logFile, "r");
         try {
-          while (offset < stat.size && !rateLimited) {
-            const length = stat.size - offset;
-            const buffer = Buffer.alloc(Math.min(length, 128 * 1024));
-            const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, offset);
-            if (bytesRead <= 0) {
-              break;
-            }
-            offset += bytesRead;
-
-            const chunk = pendingLogLine + buffer.subarray(0, bytesRead).toString("utf8");
-            const lines = chunk.split(/\r?\n/);
-            pendingLogLine = chunk.endsWith("\n") || chunk.endsWith("\r") ? "" : lines.pop() || "";
-            if (pendingLogLine.length > 8192) {
-              pendingLogLine = pendingLogLine.slice(-8192);
-            }
-
-            if (lines.some(isUsageLimitLogLine) || isUsageLimitLogLine(pendingLogLine)) {
-              rateLimited = true;
-              console.error("\n[cx-auto] usage limit detected; switching account...");
-              if (!child.killed) {
-                child.kill("SIGTERM");
-                setTimeout(() => {
-                  if (!settled && !child.killed) {
-                    child.kill("SIGKILL");
-                  }
-                }, 3000);
-              }
-            }
+          while (offset < size) {
+            const buffer = Buffer.alloc(Math.min(size - offset, 128 * 1024));
+            const count = fs.readSync(fd, buffer, 0, buffer.length, offset);
+            if (!count) break;
+            offset += count;
+            const lines = (pending + buffer.subarray(0, count).toString("utf8")).split(/\r?\n/);
+            pending = lines.pop() || "";
+            for (const line of lines) consume(line);
+            if (pending.length > 1024 * 1024) { pending = ""; identityMissing = true; }
           }
-        } finally {
-          fs.closeSync(fd);
-        }
-      } catch {
-        // The log file may not exist until Codex finishes initialization.
+          if (final && pending) { consume(pending); pending = ""; }
+        } finally { fs.closeSync(fd); }
+      } catch (error) {
+        if (error.code !== "ENOENT") identityMissing = true;
       }
     }
 
-    const timer = setInterval(scanLog, 1000);
-    child.on("exit", (code, signal) => {
-      scanLog();
-      finish({ code, signal, rateLimited });
+    const timer = setInterval(scanLog, 250);
+    child.on("error", () => {
+      clearInterval(timer);
+      activeChild = null;
+      resolve({ code: 127, rateLimited: false });
+    });
+    child.on("exit", async (code, signal) => {
+      clearInterval(timer);
+      scanLog(true);
+      if (shutdown) await shutdown;
+      activeChild = null;
+      resolve({ code, signal, rateLimited, threadId: identityMissing ? null : threadId });
     });
   });
 }
@@ -2611,7 +2568,6 @@ async function runForced(options, codexArgs, account) {
   if (!options.noTrust) {
     ensureAccountProjectTrust(account, codexArgs);
   }
-  await resumeGoalIfNeeded(account, codexArgs);
   const result = await runCodex(account, commandArgs);
   if (result.signal && terminating) {
     return 130;
@@ -2646,6 +2602,7 @@ async function runAuto(options, initialArgs) {
 
   for (;;) {
     const results = await probeAccounts(exhausted);
+    if (terminating) return 130;
     const selected = selectResult(results);
 
     if (!selected || !isUsable(selected)) {
@@ -2676,7 +2633,7 @@ async function runAuto(options, initialArgs) {
       ensureAccountProjectTrust(selected.account, codexArgs);
     }
     ensureRetrySessionAvailable(pendingRetrySession, selected.account);
-    await resumeGoalIfNeeded(selected.account, codexArgs);
+    await resumeGoalIfNeeded(selected.account, codexArgs, pendingRetrySession);
     const runStartedAt = Date.now() - 2000;
     let result;
     try {
@@ -2701,7 +2658,7 @@ async function runAuto(options, initialArgs) {
       return 1;
     }
 
-    const retryPlan = retryPlanAfterRateLimit(codexArgs, selected.account.home, { minMtimeMs: runStartedAt });
+    const retryPlan = retryPlanAfterRateLimit(codexArgs, selected.account.home, { minMtimeMs: runStartedAt, threadId: result.threadId });
     codexArgs = retryPlan.args;
     pendingRetrySession = retryPlan.session;
   }
@@ -2738,6 +2695,11 @@ if (require.main === module) {
 }
 
 module.exports = {
+  appServerRequest,
+  ensureRetrySessionAvailable,
+  findSessionFileById,
+  runCodexMonitored,
+  usageLimitThreadId,
   accountAccessTokenExpired,
   accountMatches,
   extractAccountEmail,
@@ -2754,7 +2716,7 @@ module.exports = {
   isResumeInvocation,
   isRetryableRateLimitError,
   jwtExpiryMs,
-  latestSessionTurnState,
+  readSessionTurnState,
   limitExhaustedReason,
   logChunkHasUsageLimit,
   readSessionMeta,

@@ -41,13 +41,13 @@ Requirements:
 ## Install
 
 ```sh
-npm install -g github:rmqg/codex-multi-account
+npm install -g github:kazzix14/codex-multi-account
 ```
 
 Update with the same command:
 
 ```sh
-npm install -g github:rmqg/codex-multi-account
+npm install -g github:kazzix14/codex-multi-account
 ```
 
 Confirm the commands are available:
@@ -250,6 +250,7 @@ Important points:
   from the shared `~/.codex/config.toml` into every selected account
   `config.toml`, then removed from the shared file. This avoids Codex startup
   warnings when `~/.codex/config.toml` is seen as a project-local `.codex` layer.
+- Multiline arrays and strings are parsed as complete TOML values. All config outputs are validated before setup changes homes. Existing configs receive `config.toml.cx-backup-*` backups with mode `0600`; config write failures roll back earlier writes. Unrelated settings and comments stay intact. Symlinked config files and invalid TOML are rejected. Backups are retained for recovery; directory migrations are not one atomic transaction.
 
 If you also want logs, goals, state, and memories sqlite files shared:
 
@@ -257,11 +258,11 @@ If you also want logs, goals, state, and memories sqlite files shared:
 cx-setup --accounts 3 --full --migrate
 ```
 
-`--full` is more aggressive. Avoid running multiple Codex instances that write state at the same time unless you accept the risk.
+Stop Codex sessions and app-servers before setup, removal, pruning, or `--full` migration. Linux checks explicit and default homes, including shared storage referenced by other running accounts. macOS cannot unambiguously resolve each process's home with `ps`, so setup blocks mutations while any Codex process is running. Unreadable process state also blocks mutation. `--allow-active` is an explicit override that accepts the risk; use it only when the affected state is idle. The check cannot prevent a separate Codex process starting after inspection. `--full` also shares SQLite/WAL files; it does not make concurrent writers safe.
 
 ## API Key Account
 
-You can add an API key account as a fallback.
+You can add an API key account. Creating it does not enable automatic selection.
 
 Prefer reading the key from an environment variable:
 
@@ -277,8 +278,13 @@ printf '%s' "$OPENAI_API_KEY" | cx-setup --add-api-key free --api-key-stdin --op
 
 Default selection policy:
 
-- Use normal ChatGPT/Codex accounts first.
-- Use API key accounts after those accounts fail, are unavailable, or hit limits.
+- `off` (default): automatically select ChatGPT/Codex accounts only. API accounts remain available through `cx --account <name>`.
+- `fallback`: explicitly allow API accounts when subscription accounts are unavailable or exhausted.
+- `prefer`: explicitly prefer API accounts.
+
+`CX_API_KEY_MODE=fallback cxa` enables fallback for one run. `cx-setup --api-key-mode fallback` persists it; `cx-setup --api-key-mode off` disables it again. Existing explicitly saved `fallback`/`prefer` preferences are retained.
+
+Enabling API selection may incur charges and sends the resumed conversation to the selected account's configured provider, including a custom `openai_base_url`. API quota bars are placeholders, not verified balances. cx does not enforce a spending cap. Use provider-side budgets and `CX_ACCOUNT_HOMES=name=/path,...` to restrict allowed destinations.
 
 To prefer API key accounts:
 
@@ -369,7 +375,7 @@ CX_INTERACTIVE_AUTO_EXEC=1
 
 `CX_LIMIT_TIMEOUT_MS` controls the per-probe timeout, `CX_LIMIT_RETRIES` controls attempts per account, and `CX_LIMIT_RETRY_DELAY_MS` controls the wait before retrying a failed probe.
 
-Every ChatGPT-account probe reads the current server-side weekly limit; `cx` does not select accounts from a local quota cache. Network timeouts and temporary service failures still retry as configured. If the local access token is already expired, or the server explicitly returns a non-retryable authentication error such as 401/403, probing that account stops immediately so identical failures do not delay `cx` startup.
+Every ChatGPT-account probe reads the current server-side weekly limit; `cx` does not select accounts from a local quota cache. Network timeouts and temporary service failures still retry as configured. Expired access tokens with a refresh token get one official `account/read {refreshToken:true}` refresh attempt. A failed refresh, missing refresh token, or non-retryable authentication error such as 401/403 stops probing that account. Authentication files are never copied between homes.
 
 ## How Auto-Switch Continues Work
 
@@ -388,7 +394,15 @@ codex resume <interrupted-session-id> "Continue the interrupted task ..."
 codex exec resume <interrupted-session-id> "Continue the interrupted task ..."
 ```
 
-If no exact session id is found, `cx` uses a safer fallback and avoids treating `Continue ...` as a session id.
+The quota error in the current run's private log must contain a valid `session_loop{thread_id=<UUID>}` context. cx then reads only the matching transcript, validates its freshness and working directory, and replaces named/`--last` targets with that exact ID. If attribution is unavailable or conflicting, cx stops and asks you to resume the intended thread manually. A newer shared session is never a substitute, even in the same project. Codex log-format changes may therefore disable automatic handoff safely. The transcript source must be top-level `cli` or `exec`; subagent and unknown sources are rejected because their quota errors may share the process log.
+
+When account session directories are separate, the matching transcript is copied with mode `0600`. A stale, corrupt, changed, or conflicting copy stops handoff; cx does not silently overwrite it. Transcript copying cannot transfer every kind of Codex state (for example an unshared goal database).
+
+The old process receives SIGTERM, followed by SIGKILL after three seconds if needed, and must exit before another account launches. The optional PATH wrapper first gives its child two seconds to exit. Codex remains responsible for its own tool subprocesses.
+
+Normal `resume`, including forced account selection, does not query or change goal status. Only a handoff triggered by this run's quota error can reactivate a `usageLimited` goal on the exact thread. `paused`, `blocked`, and other states stay unchanged. `CX_AUTO_RESUME_GOAL=0` disables goal recovery.
+
+This update intentionally preserves the existing approval/sandbox bypass and automatic project-trust behavior. See [security changes](SECURITY-FIXES.md).
 
 ## Troubleshooting
 
@@ -408,9 +422,9 @@ That account is not logged in:
 CODEX_HOME="$HOME/.codex-accountN" codex login
 ```
 
-`access token expired`
+`access token expired` / `token refresh failed`
 
-That account's login token has expired. Log in again before `cx` can read its current weekly limit:
+The account's access token expired and its refresh token is missing or refreshing failed. Log in again:
 
 ```sh
 CODEX_HOME="$HOME/.codex-accountN" codex login
@@ -441,7 +455,7 @@ cx-setup --install-codex-wrapper --force
 
 `cx status` does not show active accounts
 
-Active detection uses Linux `/proc`, so it may be inaccurate outside Linux.
+Linux uses `/proc`. macOS uses `ps` and reports `unknown` when homes cannot be identified reliably; unknown accounts are treated conservatively during selection, and setup refuses mutation. Exit all Codex sessions/app-servers before setup on macOS.
 
 API key checking fails
 

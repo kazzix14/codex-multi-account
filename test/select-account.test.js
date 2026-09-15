@@ -18,7 +18,7 @@ const {
   logChunkHasUsageLimit,
   pinTaskDefaultsFromAccount,
   shouldResumeGoalStatus,
-  retryArgsAfterRateLimit,
+  retryArgsAfterRateLimit: planRetryArgs,
   selectResult,
   ensureTrustedProjectsForCodexHome,
   formatProgressPercent,
@@ -73,7 +73,15 @@ function base64UrlJson(value) {
     .replace(/\//g, "_");
 }
 
+const defaultThreadId = "019eaaaa-bbbb-7ccc-8ddd-000000000001";
+const fixtureThreadIds = new Map();
+function retryArgsAfterRateLimit(args, accountHome, options) {
+  return planRetryArgs(args, accountHome, { threadId: fixtureThreadIds.get(accountHome) || defaultThreadId, ...options });
+}
+
 function writeSession(accountHome, events, options = {}) {
+  if (events[0]?.type !== "session_meta" && !options.noMeta) events.unshift(sessionMeta());
+  fixtureThreadIds.set(accountHome, events[0]?.payload?.id || defaultThreadId);
   const dir = path.join(accountHome, "sessions", "2026", "06", "03");
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, options.fileName || `rollout-test-${process.pid}-${Math.random().toString(16).slice(2)}.jsonl`);
@@ -94,7 +102,7 @@ function writeSession(accountHome, events, options = {}) {
 }
 
 function sessionMeta(id = "019eaaaa-bbbb-7ccc-8ddd-000000000001", cwd = process.cwd()) {
-  return { type: "session_meta", payload: { id, cwd } };
+  return { type: "session_meta", payload: { id, cwd, source: "cli" } };
 }
 
 function taskStarted() {
@@ -648,9 +656,9 @@ function tokenCountWithoutCredits() {
   assert.equal(isResumeInvocation(["exec", "implement feature"]), false);
   assert.equal(isResumeInvocation(["finish docs"]), false);
 
-  assert.equal(shouldResumeGoalStatus("paused"), true);
+  assert.equal(shouldResumeGoalStatus("paused"), false);
   assert.equal(shouldResumeGoalStatus("usageLimited"), true);
-  assert.equal(shouldResumeGoalStatus("blocked"), true);
+  assert.equal(shouldResumeGoalStatus("blocked"), false);
   assert.equal(shouldResumeGoalStatus("active"), false);
   assert.equal(shouldResumeGoalStatus("complete"), false);
   assert.equal(shouldResumeGoalStatus("budgetLimited"), false);
@@ -670,7 +678,9 @@ function tokenCountWithoutCredits() {
 {
   const cx = path.resolve(__dirname, "../bin/cx");
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-standalone-"));
-  const standalone = path.join(tempDir, "cx");
+  fs.mkdirSync(path.join(tempDir, "bin"));
+  fs.cpSync(path.resolve(__dirname, "../lib"), path.join(tempDir, "lib"), { recursive: true });
+  const standalone = path.join(tempDir, "bin", "cx");
   fs.copyFileSync(cx, standalone);
   fs.chmodSync(standalone, 0o755);
 
@@ -913,10 +923,9 @@ function tokenCountWithoutCredits() {
   const accountHome = tempAccountHome();
   const args = ["exec", "implement feature"];
 
-  assert.deepEqual(
-    retryArgsAfterRateLimit(args, accountHome, { minMtimeMs: Date.now() - 1000 }),
-    args,
-    "without a current session file, retry the original command instead of resuming an unrelated session",
+  assert.throws(
+    () => retryArgsAfterRateLimit(args, accountHome, { minMtimeMs: Date.now() - 1000 }),
+    /No fresh transcript/,
   );
 
   fs.rmSync(accountHome, { recursive: true, force: true });
@@ -928,7 +937,7 @@ function tokenCountWithoutCredits() {
 
   assert.deepEqual(
     retryArgsAfterRateLimit(["exec", "implement feature"], accountHome, { minMtimeMs: Date.now() - 1000 }),
-    ["exec", "resume", "--last"],
+    ["exec", "resume", defaultThreadId],
     "completed exec turns resume the session without replaying the prompt",
   );
 
@@ -945,8 +954,8 @@ function tokenCountWithoutCredits() {
 
   assert.deepEqual(
     retryArgs,
-    ["exec", "resume", "--last", retryArgs.at(-1)],
-    "usage-limited interactive turns without a session id fall back to exec resume so the prompt is not parsed as an id",
+    ["resume", defaultThreadId, retryArgs.at(-1)],
+    "usage-limited interactive turns resume the observed thread ID",
   );
   assert.match(retryArgs.at(-1), /Continue the interrupted task/);
 
@@ -971,8 +980,8 @@ function tokenCountWithoutCredits() {
 
   assert.deepEqual(
     retryArgs,
-    ["exec", "resume", "--last", retryArgs.at(-1)],
-    "queued follow-ups without a session id fall back to exec resume so the prompt is not parsed as an id",
+    ["resume", defaultThreadId, retryArgs.at(-1)],
+    "queued follow-ups resume the observed thread ID",
   );
   assert.match(retryArgs.at(-1), /Continue the interrupted task/);
 
@@ -987,7 +996,7 @@ function tokenCountWithoutCredits() {
     minMtimeMs: Date.now() - 1000,
   });
 
-  assert.deepEqual(retryArgs.slice(0, 4), ["exec", "resume", "--json", "--last"]);
+  assert.deepEqual(retryArgs.slice(0, 4), ["exec", "resume", "--json", defaultThreadId]);
   assert.match(
     retryArgs.at(-1),
     /Continue the interrupted task/,
@@ -1005,11 +1014,11 @@ function tokenCountWithoutCredits() {
     minMtimeMs: Date.now() - 1000,
   });
 
-  assert.deepEqual(retryArgs.slice(0, 3), ["exec", "resume", "019e-specific-session"]);
+  assert.deepEqual(retryArgs.slice(0, 3), ["exec", "resume", defaultThreadId]);
   assert.match(
     retryArgs.at(-1),
     /Continue the interrupted task/,
-    "incomplete exec resume turns preserve the explicit session id",
+    "incomplete exec resume turns resolve the named session to the observed thread ID",
   );
 
   fs.rmSync(accountHome, { recursive: true, force: true });
@@ -1027,7 +1036,7 @@ function tokenCountWithoutCredits() {
     },
   );
 
-  assert.deepEqual(retryArgs.slice(0, 4), ["exec", "resume", "--json", "019e-specific-session"]);
+  assert.deepEqual(retryArgs.slice(0, 4), ["exec", "resume", "--json", defaultThreadId]);
   assert.match(retryArgs.at(-1), /Continue the interrupted task/);
 
   fs.rmSync(accountHome, { recursive: true, force: true });
@@ -1041,7 +1050,7 @@ function tokenCountWithoutCredits() {
     minMtimeMs: Date.now() - 1000,
   });
 
-  assert.deepEqual(retryArgs.slice(0, 3), ["exec", "resume", "--last"]);
+  assert.deepEqual(retryArgs.slice(0, 3), ["exec", "resume", defaultThreadId]);
   assert.match(retryArgs.at(-1), /Continue the interrupted task/);
 
   fs.rmSync(accountHome, { recursive: true, force: true });
@@ -1057,7 +1066,7 @@ function tokenCountWithoutCredits() {
 
   assert.deepEqual(
     retryArgs.slice(0, 4),
-    ["exec", "resume", "--json", "--last"],
+    ["exec", "resume", "--json", defaultThreadId],
     "exec-only value options are parsed but not replayed to exec resume when unsupported",
   );
   assert.match(retryArgs.at(-1), /Continue the interrupted task/);
@@ -1075,8 +1084,8 @@ function tokenCountWithoutCredits() {
 
   assert.deepEqual(
     retryArgs,
-    ["-m", "gpt-5", "exec", "resume", "--last", retryArgs.at(-1)],
-    "incomplete interactive turns without a session id preserve global options and fall back to exec resume",
+    ["-m", "gpt-5", "resume", defaultThreadId, retryArgs.at(-1)],
+    "incomplete interactive turns preserve global options and resume the observed ID",
   );
   assert.match(retryArgs.at(-1), /Continue the interrupted task/);
 
@@ -1093,8 +1102,8 @@ function tokenCountWithoutCredits() {
 
   assert.deepEqual(
     retryArgs,
-    ["exec", "resume", "--last", retryArgs.at(-1)],
-    "interactive resume retries without a session id fall back to exec resume with a prompt",
+    ["resume", defaultThreadId, retryArgs.at(-1)],
+    "interactive resume retries resume the observed thread ID with a prompt",
   );
   assert.match(retryArgs.at(-1), /Continue the interrupted task/);
 
@@ -1109,7 +1118,7 @@ function tokenCountWithoutCredits() {
     minMtimeMs: Date.now() - 1000,
   });
 
-  assert.deepEqual(retryArgs.slice(0, 2), ["resume", "019e-interactive-session"]);
+  assert.deepEqual(retryArgs.slice(0, 2), ["resume", defaultThreadId]);
   assert.match(retryArgs.at(-1), /Continue the interrupted task/);
 
   fs.rmSync(accountHome, { recursive: true, force: true });
@@ -1128,7 +1137,7 @@ function tokenCountWithoutCredits() {
 
     assert.deepEqual(
       retryArgs,
-      ["exec", "resume", "--last", retryArgs.at(-1)],
+      ["exec", "resume", defaultThreadId, retryArgs.at(-1)],
       "CX_INTERACTIVE_AUTO_EXEC=1 preserves the non-interactive exec resume behavior",
     );
     assert.match(retryArgs.at(-1), /Continue the interrupted task/);
@@ -1153,7 +1162,7 @@ function tokenCountWithoutCredits() {
       minMtimeMs: Date.now() - 1000,
     });
 
-    assert.deepEqual(retryArgs.slice(0, 3), ["exec", "resume", "019e-interactive-session"]);
+    assert.deepEqual(retryArgs.slice(0, 3), ["exec", "resume", defaultThreadId]);
     assert.match(retryArgs.at(-1), /Continue the interrupted task/);
   } finally {
     if (previous === undefined) {
@@ -1173,8 +1182,8 @@ function tokenCountWithoutCredits() {
 
   assert.deepEqual(
     retryArgs,
-    ["exec", "resume", "--last", retryArgs.at(-1)],
-    "event_msg user_message without a session id falls back to exec resume",
+    ["resume", defaultThreadId, retryArgs.at(-1)],
+    "event_msg user_message resumes the observed thread ID",
   );
   assert.match(retryArgs.at(-1), /Continue the interrupted task/);
 
@@ -1204,19 +1213,11 @@ function tokenCountWithoutCredits() {
   const accountHome = tempAccountHome();
   const threadId = "019eaaaa-bbbb-7ccc-8ddd-000000000125";
   writeSession(accountHome, [taskStarted(), userMessage("resume filename session")], {
-    fileName: `rollout-2026-06-03T00-00-00-${threadId}.jsonl`,
+    fileName: `rollout-2026-06-03T00-00-00-${threadId}.jsonl`, noMeta: true,
   });
-
-  const retryArgs = retryArgsAfterRateLimit(["resume", "--last"], accountHome, {
-    minMtimeMs: Date.now() - 1000,
-  });
-
-  assert.deepEqual(
-    retryArgs,
-    ["resume", threadId, retryArgs.at(-1)],
-    "interactive retries use the rollout filename session id when session_meta is unavailable",
-  );
-  assert.match(retryArgs.at(-1), /Continue the interrupted task/);
+  assert.throws(() => retryArgsAfterRateLimit(["resume", "--last"], accountHome, {
+    threadId, minMtimeMs: Date.now() - 1000,
+  }), /No fresh transcript/, "a filename alone is not trusted as session identity");
 
   fs.rmSync(accountHome, { recursive: true, force: true });
 }
@@ -1242,7 +1243,7 @@ function tokenCountWithoutCredits() {
 
   assert.deepEqual(
     retryArgsAfterRateLimit(["finish docs"], accountHome, { minMtimeMs: Date.now() - 1000 }),
-    ["finish docs"],
+    ["resume", defaultThreadId, "finish docs"],
     "interactive prompts are replayed when the session exists but the user instruction was not recorded",
   );
 

@@ -4,6 +4,8 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { assertHomesInactive, canonical, inspectCodexProcesses } = require("../lib/processes");
+const { commitConfigs, editTopLevel, planSharedUserConfig, readConfig } = require("../lib/config-migration");
 
 const home = os.homedir();
 const defaultSharedItems = [
@@ -33,10 +35,8 @@ const fullSharedItems = [
   "state_5.sqlite-shm",
   "state_5.sqlite-wal",
 ];
-const apiKeyModes = new Set(["prefer", "fallback"]);
 const apiKeyCheckModes = new Set(["auto", "models", "responses", "chat"]);
 const defaultApiKeyCheckTimeoutMs = 15000;
-const sharedUserConfigTopLevelKeys = new Set(["notify"]);
 
 function usage() {
   console.log(`Usage:
@@ -114,7 +114,7 @@ Options:
                         List selected/discovered account homes without changing files.
   --remove SELECTOR     Move a discovered/configured account home to a backup.
   --prune               With --accounts/--homes, move extra discovered homes to backups.
-  --api-key-mode MODE   Persist local auto-selection mode: prefer or fallback.
+  --api-key-mode MODE   Persist local auto-selection mode: off (default), prefer or fallback. Enabling API use may incur charges.
   --install-codex-wrapper
                         Install/update ~/.local/bin/codex so direct codex runs
                         persist project trust before launching the real Codex CLI.
@@ -618,38 +618,6 @@ function mergeAccounts(...groups) {
   return merged;
 }
 
-function activeCodexHomes() {
-  const active = new Set();
-  let pids;
-  try {
-    pids = fs.readdirSync("/proc").filter((entry) => /^\d+$/.test(entry));
-  } catch {
-    return active;
-  }
-
-  for (const pid of pids) {
-    try {
-      const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean);
-      const command = cmdline.join(" ");
-      if (!command.includes("codex") || command.includes("app-server")) {
-        continue;
-      }
-      const codexHome = fs
-        .readFileSync(`/proc/${pid}/environ`, "utf8")
-        .split("\0")
-        .map((entry) => entry.match(/^CODEX_HOME=(.*)$/))
-        .find(Boolean)?.[1];
-      if (codexHome) {
-        active.add(path.resolve(codexHome));
-      }
-    } catch {
-      // Processes can exit while we scan /proc.
-    }
-  }
-
-  return active;
-}
-
 function backupPath(target) {
   const stamp = new Date().toISOString().replace(/[-:T.Z]/g, "").slice(0, 14);
   return `${target}.cx-backup-${stamp}-${process.pid}`;
@@ -734,7 +702,8 @@ function normalizeApiKeyMode(value, label = "api key mode") {
   if (["fallback", "account-first", "after-limit", "limit-fallback", "limit-exhausted"].includes(normalized)) {
     return "fallback";
   }
-  throw new Error(`${label} must be prefer or fallback`);
+  if (normalized === "off") return "off";
+  throw new Error(`${label} must be off, prefer or fallback`);
 }
 
 function normalizeApiKeyCheckMode(value, label = "--api-key-check") {
@@ -899,7 +868,7 @@ function linkedSharedItemCount(accountHome, sharedHome, items) {
 
 function printAccountList(accounts, sharedHome, options) {
   const items = options.full ? fullSharedItems : defaultSharedItems;
-  const activeHomes = activeCodexHomes();
+  const inspection = inspectCodexProcesses();
   const normalizedSharedHome = path.resolve(sharedHome);
   if (accounts.length < 1) {
     console.log("No Codex account homes found.");
@@ -909,7 +878,7 @@ function printAccountList(accounts, sharedHome, options) {
   console.log("Account   exists   active   auth      linked   home");
   for (const account of accounts) {
     const exists = fs.lstatSync(account.home, { throwIfNoEntry: false }) ? "yes" : "-";
-    const active = activeHomes.has(account.home) ? "yes" : "-";
+    const active = inspection.unknown ? "unknown" : inspection.homes.has(canonical(account.home)) ? "yes" : "-";
     const auth = accountAuthLabel(account);
     const linked = `${linkedSharedItemCount(account.home, normalizedSharedHome, items)}/${items.length}`;
     console.log(
@@ -1112,186 +1081,10 @@ function tomlString(value) {
   return JSON.stringify(String(value));
 }
 
-function firstTableLine(lines) {
-  const index = lines.findIndex((line) => /^\s*\[/.test(line));
-  return index >= 0 ? index : lines.length;
-}
-
-function stripTomlComment(line) {
-  let inSingle = false;
-  let inDouble = false;
-  let escaped = false;
-
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (inDouble && char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (!inDouble && char === "'") {
-      inSingle = !inSingle;
-      continue;
-    }
-    if (!inSingle && char === '"') {
-      inDouble = !inDouble;
-      continue;
-    }
-    if (!inSingle && !inDouble && char === "#") {
-      return line.slice(0, index);
-    }
-  }
-
-  return line;
-}
-
-function topLevelKeyMatch(line) {
-  return stripTomlComment(line).trim().match(/^([A-Za-z0-9_-]+)\s*=\s*(.+)$/u);
-}
-
-function readTopLevelTomlRawValues(file, keys) {
-  const values = new Map();
-  let text;
-  try {
-    text = fs.readFileSync(file, "utf8");
-  } catch {
-    return values;
-  }
-
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
-  const tableIndex = firstTableLine(lines);
-  for (let index = 0; index < tableIndex; index += 1) {
-    const match = topLevelKeyMatch(lines[index]);
-    if (!match || !keys.has(match[1])) {
-      continue;
-    }
-    values.set(match[1], match[2].trim());
-  }
-  return values;
-}
-
-function upsertTopLevelTomlRawValues(file, values, options) {
-  if (values.size < 1) {
-    return;
-  }
-
-  const existing = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-  const lines = existing ? existing.replace(/\r\n/g, "\n").split("\n") : [];
-  if (lines.length > 0 && lines.at(-1) === "") {
-    lines.pop();
-  }
-
-  const pending = new Map(values);
-  const tableIndex = firstTableLine(lines);
-  for (let index = 0; index < tableIndex; index += 1) {
-    const match = topLevelKeyMatch(lines[index]);
-    if (!match || !pending.has(match[1])) {
-      continue;
-    }
-    lines[index] = `${match[1]} = ${pending.get(match[1])}`;
-    pending.delete(match[1]);
-  }
-
-  if (pending.size > 0) {
-    const insert = [...pending.entries()].map(([key, value]) => `${key} = ${value}`);
-    lines.splice(tableIndex, 0, ...insert, ...(tableIndex === 0 && lines.length > 0 ? [""] : []));
-  }
-
-  if (options.dryRun) {
-    console.log(`[dry-run] write ${file}`);
-    return;
-  }
-  ensureParent(file, options);
-  fs.writeFileSync(file, `${lines.join("\n")}\n`, { mode: 0o600 });
-}
-
-function removeTopLevelTomlKeys(file, keys, options) {
-  if (!fs.existsSync(file)) {
-    return;
-  }
-
-  const original = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
-  const lines = original.split("\n");
-  const hadTrailingNewline = lines.at(-1) === "";
-  if (hadTrailingNewline) {
-    lines.pop();
-  }
-  const tableIndex = firstTableLine(lines);
-  let changed = false;
-  const nextLines = [];
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const match = index < tableIndex ? topLevelKeyMatch(lines[index]) : null;
-    if (match && keys.has(match[1])) {
-      changed = true;
-      continue;
-    }
-    nextLines.push(lines[index]);
-  }
-
-  while (nextLines.length > 1 && nextLines[0] === "" && /^\s*\[/.test(nextLines[1])) {
-    nextLines.shift();
-    changed = true;
-  }
-
-  if (!changed) {
-    return;
-  }
-  if (options.dryRun) {
-    console.log(`[dry-run] remove ${[...keys].join(", ")} from ${file}`);
-    return;
-  }
-  fs.writeFileSync(file, `${nextLines.join("\n")}\n`, { mode: 0o600 });
-}
-
-function syncSharedUserConfig(sharedHome, accounts, options) {
-  const sharedConfig = path.join(sharedHome, "config.toml");
-  const values = readTopLevelTomlRawValues(sharedConfig, sharedUserConfigTopLevelKeys);
-  if (values.size < 1 || accounts.length < 1) {
-    return;
-  }
-
-  for (const account of accounts) {
-    upsertTopLevelTomlRawValues(path.join(account.home, "config.toml"), values, options);
-  }
-  removeTopLevelTomlKeys(sharedConfig, sharedUserConfigTopLevelKeys, options);
-  console.log(
-    `synced ${[...values.keys()].join(", ")} from ${sharedConfig} to ${accounts.length} account config.toml file(s)`,
-  );
-}
-
 function upsertTopLevelTomlStrings(file, values, options) {
-  const existing = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-  const lines = existing ? existing.replace(/\r\n/g, "\n").split("\n") : [];
-  if (lines.length > 0 && lines.at(-1) === "") {
-    lines.pop();
-  }
-
-  const pending = new Map(Object.entries(values).filter(([, value]) => value !== null && value !== undefined));
-  const tableIndex = firstTableLine(lines);
-  for (let index = 0; index < tableIndex; index += 1) {
-    const match = lines[index].match(/^\s*([A-Za-z0-9_-]+)\s*=/);
-    if (!match || !pending.has(match[1])) {
-      continue;
-    }
-    lines[index] = `${match[1]} = ${tomlString(pending.get(match[1]))}`;
-    pending.delete(match[1]);
-  }
-
-  if (pending.size > 0) {
-    const insert = [...pending.entries()].map(([key, value]) => `${key} = ${tomlString(value)}`);
-    lines.splice(tableIndex, 0, ...insert, ...(tableIndex === 0 && lines.length > 0 ? [""] : []));
-  }
-
-  if (options.dryRun) {
-    console.log(`[dry-run] write ${file}`);
-    return;
-  }
-  ensureParent(file, options);
-  fs.writeFileSync(file, `${lines.join("\n")}\n`, { mode: 0o600 });
+  const config = readConfig(file);
+  const filtered = Object.fromEntries(Object.entries(values).filter(([, value]) => value !== null && value !== undefined));
+  commitConfigs([{ ...config, text: editTopLevel(config.text, filtered) }], options);
 }
 
 async function writeApiKeyAccount(account, options) {
@@ -1377,7 +1170,6 @@ async function setup(options) {
   const selectedHomes = new Set(homes.map((account) => account.home));
   const discoveredAccounts = validateAccounts(discoverAccountHomes(), sharedHome);
   const removableAccounts = mergeAccounts(homes, discoveredAccounts);
-  const activeHomes = activeCodexHomes();
   const removeTargets = [];
   let apiKeyAccount = null;
 
@@ -1385,13 +1177,6 @@ async function setup(options) {
     const accounts = hasConfiguredHomes ? homes : discoveredAccounts;
     printAccountList(accounts, sharedHome, options);
     return;
-  }
-
-  if (options.apiKeyMode) {
-    writeLocalConfigPatch({ apiKeyMode: options.apiKeyMode }, options);
-  }
-  if (options.installCodexWrapper) {
-    installCodexWrapper(options);
   }
 
   for (const selector of options.remove) {
@@ -1409,34 +1194,26 @@ async function setup(options) {
   }
 
   const uniqueRemoveTargets = [...new Map(removeTargets.map((account) => [account.home, account])).values()];
-  const activeRemoveTargets = uniqueRemoveTargets.filter((account) => activeHomes.has(account.home));
-  if (activeRemoveTargets.length > 0 && !options.allowActive && !options.dryRun) {
-    throw new Error(
-      `Refusing to remove active Codex homes: ${activeRemoveTargets.map((account) => account.home).join(", ")}. ` +
-        "Exit those Codex sessions first, or rerun with --allow-active if you accept the risk.",
-    );
-  }
-  for (const account of uniqueRemoveTargets) {
-    removeAccountHome(account, options);
-  }
   const removedHomes = new Set(uniqueRemoveTargets.map((account) => account.home));
   const remainingHomes = homes.filter((account) => !removedHomes.has(account.home));
+  const touchedHomes = [...uniqueRemoveTargets.map((account) => account.home),
+    ...remainingHomes.map((account) => account.home), ...(remainingHomes.length ? [sharedHome] : [])];
+  const checkInactive = () => {
+    if (touchedHomes.length && !options.allowActive && !options.dryRun) assertHomesInactive(touchedHomes, items);
+  };
+  checkInactive();
+  // Validate every config before any home is moved or linked.
+  const configPlan = remainingHomes.length ? planSharedUserConfig(sharedHome, remainingHomes) : [];
+  if (options.apiKeyMode) {
+    writeLocalConfigPatch({ apiKeyMode: options.apiKeyMode }, options);
+  }
+  if (options.installCodexWrapper) {
+    installCodexWrapper(options);
+  }
 
-  if (remainingHomes.length < 1) {
-    if (options.apiKeyMode || options.installCodexWrapper || uniqueRemoveTargets.length > 0) {
-      return;
-    }
+  if (remainingHomes.length < 1 && !options.apiKeyMode && !options.installCodexWrapper && !uniqueRemoveTargets.length) {
     throw new Error("No account homes selected. Use --accounts <N> on a new machine, or --homes name=/path,...");
   }
-  const activeTargets = remainingHomes.filter((account) => activeHomes.has(account.home));
-
-  if (activeTargets.length > 0 && !options.allowActive && !options.dryRun) {
-    throw new Error(
-      `Refusing to modify active Codex homes: ${activeTargets.map((account) => account.home).join(", ")}. ` +
-      "Exit those Codex sessions first, or rerun with --allow-active if you accept the risk.",
-    );
-  }
-
   if (options.addApiKey) {
     apiKeyAccount = remainingHomes.find((candidate) => candidate.name.toLowerCase() === options.addApiKey.toLowerCase());
     if (!apiKeyAccount) {
@@ -1445,16 +1222,22 @@ async function setup(options) {
     await preflightApiKeyAccount(apiKeyAccount, options);
   }
 
+  checkInactive(); // Endpoint preflight may have taken time; inspect again before mutation.
+  for (const account of uniqueRemoveTargets) removeAccountHome(account, options);
+  if (!remainingHomes.length) return;
   ensureDir(sharedHome, options);
 
   for (const { home: accountHome } of remainingHomes) {
+    checkInactive();
     ensureDir(accountHome, options);
     for (const item of items) {
       linkItem(accountHome, sharedHome, item, options);
     }
     console.log(`configured ${accountHome}`);
   }
-  syncSharedUserConfig(sharedHome, remainingHomes, options);
+  checkInactive();
+  commitConfigs(configPlan, options);
+  if (configPlan.length) console.log(`synced notify from ${sharedHome}/config.toml to ${remainingHomes.length} account config.toml file(s)`);
 
   if (options.addApiKey) {
     await writeApiKeyAccount(apiKeyAccount, options);

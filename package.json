@@ -1,17 +1,17 @@
 {
   "name": "codex-multi-account",
-  "version": "0.8.10",
+  "version": "0.8.11",
   "description": "Small account-switching wrappers for the OpenAI Codex CLI.",
   "license": "GPL-3.0-only",
   "author": "rmqg",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rmqg/codex-multi-account.git"
+    "url": "git+https://github.com/kazzix14/codex-multi-account.git"
   },
   "bugs": {
-    "url": "https://github.com/rmqg/codex-multi-account/issues"
+    "url": "https://github.com/kazzix14/codex-multi-account/issues"
   },
-  "homepage": "https://github.com/rmqg/codex-multi-account#readme",
+  "homepage": "https://github.com/kazzix14/codex-multi-account#readme",
   "type": "commonjs",
   "bin": {
     "cx": "./bin/cx",
@@ -21,10 +21,11 @@
   },
   "files": [
     "bin",
+    "lib",
     "docs"
   ],
   "scripts": {
-    "test": "node --check bin/cx && node --check bin/codex && node --check bin/cx-setup && sh -n bin/cxa && sh -n bin/cxr && node test/select-account.test.js && node test/setup.test.js && node test/virtual-e2e.test.js"
+    "test": "node --check bin/cx && node --check bin/codex && node --check bin/cx-setup && sh -n bin/cxa && sh -n bin/cxr && node test/select-account.test.js && node test/setup.test.js && node test/virtual-e2e.test.js && node test/security.test.js"
   },
   "engines": {
     "node": ">=18"
@@ -34,5 +35,8 @@
     "openai",
     "cli",
     "account-switcher"
-  ]
+  ],
+  "dependencies": {
+    "smol-toml": "1.8.0"
+  }
 }

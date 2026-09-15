@@ -5,6 +5,7 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { stopChild } = require("../lib/processes");
 const {
   ensureTrustedProjectsForCodexHome,
   trustedProjectPathsFromCodexArgs,
@@ -83,9 +84,7 @@ function main() {
 
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => {
-      if (!child.killed) {
-        child.kill(signal);
-      }
+      void stopChild(child, signal, 2000);
     });
   }
 
