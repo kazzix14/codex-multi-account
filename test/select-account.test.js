@@ -893,7 +893,8 @@ function tokenCountWithoutCredits() {
 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /No Codex account homes found/);
-  assert.match(result.stderr, /cx-setup --accounts <N> --migrate/);
+  assert.match(result.stderr, /cx-setup --accounts <N>/);
+  assert.doesNotMatch(result.stderr, /--migrate/);
   fs.rmSync(tempHome, { recursive: true, force: true });
 }
 

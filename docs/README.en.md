@@ -15,7 +15,7 @@ It is not a model proxy. It does not forward model traffic. It does not share yo
 Use it if:
 
 - You have multiple ChatGPT/Codex accounts.
-- You want those accounts to share conversation sessions.
+- You want an interrupted conversation copied to the next account when usage runs out.
 - You want official Codex CLI behavior, not a relay/proxy workflow.
 - You often hit usage limits and want smoother account handoff.
 
@@ -59,10 +59,10 @@ cx-setup --help
 
 ## First Setup
 
-If you have 3 accounts, create 3 account folders:
+If you have 3 accounts, create 3 independent account folders. Codex can keep running:
 
 ```sh
-cx-setup --accounts 3 --migrate
+cx-setup --accounts 3
 ```
 
 This creates:
@@ -119,7 +119,7 @@ Run a one-shot task:
 cx exec "explain this repo"
 ```
 
-Resume the last conversation:
+Resume the selected account's last conversation:
 
 ```sh
 cxr
@@ -153,13 +153,13 @@ These three quota commands are equivalent.
 ```sh
 cx [codex args...]              # Run Codex with automatic account selection
 cxa [codex args...]             # Auto mode, same as cx auto
-cxr [extra resume args...]      # Resume the last conversation
+cxr [extra resume args...]      # Resume the selected account's last conversation
 cx status                       # Show account status and used quota
 cx quota                        # Show weighted total, reset times, and per-account bars
 cx --account 2                  # Use only account 2
 cx --no-trust                   # Do not write project trust automatically
 cx --no-bypass                  # Do not add the bypass flag automatically
-cx-setup --accounts 3 --migrate # Create 3 account folders
+cx-setup --accounts 3 # Create 3 account folders
 cx-setup --list                 # List account folders
 ```
 
@@ -223,42 +223,40 @@ rehash
 
 Or open a new terminal.
 
-## What Gets Shared
+## Independent Homes and Optional Sharing
 
-Default shared items:
+The default `cx-setup --accounts 3` creates only missing account homes. Each new home receives a validated, private copy of `~/.codex/config.toml`, preserving its settings and formatting. Use `--home /path/to/source` to select a different config source. New home directories have mode `0700` and copied configs have mode `0600`.
 
-```text
-sessions
-archived_sessions
-memories
-skills
-shell_snapshots
-cache
-generated_images
-history.jsonl
-models_cache.json
-```
+- The source config, including `notify`, stays unchanged.
+- Existing homes, configs, logins and links are left untouched. Increasing `--accounts` initializes only the new homes; rerunning setup does not synchronize later config edits.
+- `auth.json` is never copied or linked. Log in separately for each account.
+- Skills/plugins, conversation history, caches and SQLite databases are not copied during setup.
+- During automatic handoff, cx copies only the exact interrupted conversation into the next home. The original stays in place; a conflicting destination stops handoff.
+- `cxr`/`resume --last` sees the selected account's history. To resume a conversation in a particular home, use `cx --account 1 resume --last` or an explicit ID with that account. Automatic handoff from that running conversation still works when using auto mode.
+- Creating independent homes does not need an activity check or require Codex to exit, because it does not modify existing homes or shared data.
 
-Important points:
+### Optional Shared Storage
 
-- Session history is shared, so switching accounts can continue more easily.
-- `auth.json` is not shared.
-- Every account keeps its own login.
-- `config.toml` is not symlinked. Each account can keep its own auth, provider,
-  profile, model, and project-trust settings.
-- During setup, top-level shared user-only settings such as `notify` are copied
-  from the shared `~/.codex/config.toml` into every selected account
-  `config.toml`, then removed from the shared file. This avoids Codex startup
-  warnings when `~/.codex/config.toml` is seen as a project-local `.codex` layer.
-- Multiline arrays and strings are parsed as complete TOML values. All config outputs are validated before setup changes homes. Existing configs receive `config.toml.cx-backup-*` backups with mode `0600`; config write failures roll back earlier writes. Unrelated settings and comments stay intact. Symlinked config files and invalid TOML are rejected. Backups are retained for recovery; directory migrations are not one atomic transaction.
-
-If you also want logs, goals, state, and memories sqlite files shared:
+To explicitly opt into shared workspace links:
 
 ```sh
+cx-setup --accounts 3 --share
+```
+
+Shared items are `sessions`, `archived_sessions`, `memories`, `skills`, `shell_snapshots`, `cache`, `generated_images`, `history.jsonl`, and `models_cache.json`.
+
+If account homes already contain those items, `--migrate` merges them into the shared home, backs up the originals and replaces the account paths with links. `--full` includes logs and SQLite/WAL state:
+
+```sh
+cx-setup --accounts 3 --share --migrate
 cx-setup --accounts 3 --full --migrate
 ```
 
-Stop Codex sessions and app-servers before setup, removal, pruning, or `--full` migration. Linux checks explicit and default homes, including shared storage referenced by other running accounts. macOS cannot unambiguously resolve each process's home with `ps`, so setup blocks mutations while any Codex process is running. Unreadable process state also blocks mutation. `--allow-active` is an explicit override that accepts the risk; use it only when the affected state is idle. The check cannot prevent a separate Codex process starting after inspection. `--full` also shares SQLite/WAL files; it does not make concurrent writers safe.
+For compatibility, `--migrate` or `--full` alone also enables sharing. `--force` alone does not. Existing shared setups are not detached by the default independent setup.
+
+In sharing mode, setup still moves `notify` from the shared config into account configs. Multiline values are parsed in full; affected configs are validated first, backed up with mode `0600`, and restored on config-write failure. Directory migration is not one atomic transaction.
+
+Sharing/migration, removal/pruning, and updating an existing API-key home still check for active Codex processes. Linux checks explicit/default homes and shared resources. On macOS, those guarded operations conservatively stop if any Codex process is running or activity cannot be verified. Ordinary independent setup does not run this guard. `--allow-active` explicitly overrides it. Keep the affected data idle during guarded operations; inspection cannot prevent a separately launched process from starting afterward. Shared SQLite/WAL files still require care with concurrent writers.
 
 ## API Key Account
 
@@ -267,13 +265,13 @@ You can add an API key account. Creating it does not enable automatic selection.
 Prefer reading the key from an environment variable:
 
 ```sh
-OPENAI_API_KEY=sk-... cx-setup --add-api-key free --api-key-env OPENAI_API_KEY --openai-base-url https://proxy.example.com/v1 --model gpt-5.5 --api-key-check --migrate
+OPENAI_API_KEY=sk-... cx-setup --add-api-key free --api-key-env OPENAI_API_KEY --openai-base-url https://proxy.example.com/v1 --model gpt-5.5 --api-key-check
 ```
 
 Or read it from stdin so it is not stored in shell history:
 
 ```sh
-printf '%s' "$OPENAI_API_KEY" | cx-setup --add-api-key free --api-key-stdin --openai-base-url https://proxy.example.com/v1 --model gpt-5.5 --api-key-check --migrate
+printf '%s' "$OPENAI_API_KEY" | cx-setup --add-api-key free --api-key-stdin --openai-base-url https://proxy.example.com/v1 --model gpt-5.5 --api-key-check
 ```
 
 Default selection policy:
@@ -300,7 +298,7 @@ The local API key mode is stored in `~/.config/codex-cx/config.json`. The direct
 If you had 3 accounts and now want 4:
 
 ```sh
-cx-setup --accounts 4 --migrate
+cx-setup --accounts 4
 CODEX_HOME="$HOME/.codex-account4" codex login
 ```
 
@@ -325,7 +323,7 @@ Removal does not delete data. It moves the account folder to a `.cx-backup-*` ba
 If you do not want numbered folders:
 
 ```sh
-cx-setup --homes work=~/.codex-work,school=~/.codex-school --migrate
+cx-setup --homes work=~/.codex-work,school=~/.codex-school
 ```
 
 Use them like this:
@@ -411,7 +409,7 @@ This update intentionally preserves the existing approval/sandbox bypass and aut
 Create account folders first:
 
 ```sh
-cx-setup --accounts 3 --migrate
+cx-setup --accounts 3
 ```
 
 `missing ~/.codex-accountN/auth.json`
@@ -455,7 +453,7 @@ cx-setup --install-codex-wrapper --force
 
 `cx status` does not show active accounts
 
-Linux uses `/proc`. macOS uses `ps` and reports `unknown` when homes cannot be identified reliably; unknown accounts are treated conservatively during selection, and setup refuses mutation. Exit all Codex sessions/app-servers before setup on macOS.
+Linux uses `/proc`. macOS uses `ps` and can report `unknown`; account selection treats unknown activity conservatively. This does not block creating independent homes. Sharing/migration, removal and updates to existing API-key homes retain the guard and may require exiting Codex on macOS.
 
 API key checking fails
 

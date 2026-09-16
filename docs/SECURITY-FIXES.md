@@ -2,6 +2,14 @@
 
 Reviewed against the 2026-09-15 audit of upstream commit `20bf67aebcc7b780b9825596843b44f5c64575db` (0.8.10).
 
+## 0.8.12: Independent setup without moving existing data
+
+On 2026-09-16, the default setup changed to create independent account homes and copy only the source `config.toml` into newly created homes. The source stays unchanged, including `notify`; existing homes and shared links are preserved. Authentication and state databases are not copied. Handoff continues to copy only the exact interrupted conversation.
+
+Ordinary setup no longer runs the process guard and can run while Codex is active. `--share` explicitly enables the previous sharing layout; `--migrate` and `--full` also retain their sharing semantics. Sharing, removal/pruning, and updates to existing API-key homes still use the guard described below. Approval/sandbox bypass and automatic project trust remain deferred and unchanged.
+
+Regression tests cover a running Codex process during new-home creation, preservation of the source and existing accounts, config-copy permissions, dry runs, invalid source TOML, a missing source, and end-to-end handoff between homes created with the new default. The source config is an initial snapshot; later settings edits and skills/plugins are not automatically synchronized. Manual `resume --last` still refers to the selected account's history.
+
 ## Audit findings
 
 | Finding | Change | Regression coverage |
@@ -10,7 +18,7 @@ Reviewed against the 2026-09-15 audit of upstream commit `20bf67aebcc7b780b98255
 | Unattended API billing/provider change | Default API auto-selection to `off`; require explicit `fallback`/`prefer` or forced `--account`. Display a billing/provider notice when auto mode chooses an API account. | Default exclusion, exhaustion without fallback, explicit opt-in modes. |
 | Approval/sandbox bypass and automatic project trust | **Deferred at the user's request. Existing behavior retained.** | Existing safety-override and trust tests retained. |
 | Multiline TOML corruption | Parse complete values using pinned `smol-toml@1.8.0`. Validate all affected configs before changing homes, preserve unrelated statements, back up originals with mode `0600`, stage file replacement and roll back failed config writes. | Multiline arrays and strings, quoted keys, comments, unrelated dotted keys, malformed TOML, symlinks, idempotency, dry run and injected write failure. |
-| Active homes modified on macOS | Check processes on Linux and macOS, including app-server/default homes and shared resources. Fail closed when activity cannot be resolved. On macOS, conservatively block setup while any Codex process runs. | Actual temporary Codex processes protect removal; Linux explicit/default homes; shared storage; unknown inspection. |
+| Active homes modified on macOS | Check processes on Linux and macOS before sharing/migration, removal or existing API-key updates, including app-server/default homes and shared resources. Fail closed when activity cannot be resolved. Independent new-home creation leaves existing data alone and skips this guard. | Actual temporary Codex processes protect removal and sharing while independent creation succeeds; Linux explicit/default homes; shared storage; unknown inspection. |
 | Manually stopped goals reactivated | Normal resume does not query/change goals. Quota-triggered handoff only reactivates `usageLimited` on its exact thread. | Ordinary/forced resume and automatic handoff with `paused`, `blocked`, `usageLimited`, `active`, `complete`; recovery opt-out. |
 | SIGKILL escalation skipped | Test process exit state instead of `child.killed`. Wait for termination before handoff/RPC completion; forward signals to probe children. Give the optional PATH wrapper's child a shorter grace period. | Real subprocess ignoring SIGTERM, monitor cleanup and app-server timeout through the PATH wrapper; verify the underlying PID has exited. |
 
@@ -27,7 +35,7 @@ Additional fixes: expired access tokens with refresh tokens get one official Cod
 
 - Automatic handoff depends on Codex log format: the quota error must identify a full UUID in `session_loop{thread_id=...}`. Unsupported logs stop automatic handoff; resume the intended thread manually. Only top-level `cli`/`exec` transcript sources are accepted; subagent/unknown sources stop safely. This is not a guarantee of compatibility with every Codex version.
 - API balances remain unknown. cx does not enforce a monetary budget. Explicitly saved `prefer`/`fallback` preferences remain effective after upgrading. Use `cx-setup --api-key-mode off` to disable them and `CX_ACCOUNT_HOMES` to limit candidate accounts.
-- Process inspection is a preflight check, not a lock respected by independently launched Codex instances. Keep Codex stopped throughout setup. `--allow-active` explicitly overrides the guard. Full shared SQLite/WAL state still requires care with concurrent writers.
+- Process inspection is a preflight check, not a lock respected by independently launched Codex instances. Keep affected data idle throughout sharing/migration, removal or existing API-key updates. `--allow-active` explicitly overrides that guard. Independent setup does not need Codex to stop. Full shared SQLite/WAL state still requires care with concurrent writers.
 - Config backups remain on disk. Individual config replacements are atomic, and detected write failures roll back; a whole directory migration is not a single transaction. After a crash, restore from the reported backups if necessary.
 - Only session transcripts are copied between separate homes. Other state, such as an unshared goal database, stays local. Authentication files are never copied or linked.
 - The wrapper waits for its Codex process to exit. The supplied PATH wrapper also terminates its child. Codex is responsible for its own tool subprocesses; arbitrary third-party wrappers are outside this guarantee.

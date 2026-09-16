@@ -163,6 +163,21 @@ async function checkProcesses() {
       });
       assert.equal(setup.status, 2, setup.stderr);
       assert.ok(fs.existsSync(home), "active home must not be renamed");
+      const create = spawnSync(process.execPath, [path.join(repo, "bin/cx-setup"), "--accounts", "2", "--home", home], {
+        env: { ...process.env, HOME: root }, encoding: "utf8",
+      });
+      assert.equal(create.status, 0, create.stderr);
+      assert.equal(child.exitCode, null, "creating independent homes must leave the running Codex alone");
+      const migrate = spawnSync(process.execPath, [path.join(repo, "bin/cx-setup"), "--accounts", "2", "--home", home, "--share"], {
+        env: { ...process.env, HOME: root }, encoding: "utf8",
+      });
+      assert.equal(migrate.status, 2, "sharing a running source still requires the activity guard");
+      assert.equal(fs.existsSync(path.join(root, ".codex-account1", "sessions")), false);
+      const update = spawnSync(process.execPath, [path.join(repo, "bin/cx-setup"), "--add-api-key", "running", "--account-home", home, "--api-key", "fixture-only"], {
+        env: { ...process.env, HOME: root }, encoding: "utf8",
+      });
+      assert.equal(update.status, 2, "replacing credentials in an existing active home must remain guarded");
+      assert.equal(fs.existsSync(path.join(home, "auth.json")), false);
     } finally { await stopChild(child); }
   }
   // Default HOME without CODEX_HOME is protected on Linux too.

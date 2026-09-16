@@ -157,7 +157,7 @@ function usage() {
   cx --no-trust [codex args...]
 
 Beginner path:
-  1. Create account folders: cx-setup --accounts 3 --migrate
+  1. Create account folders: cx-setup --accounts 3
   2. Log in each account:   CODEX_HOME="$HOME/.codex-account1" codex login
   3. Check accounts:        cx status
   4. Check remaining quota: cx quota
@@ -704,7 +704,7 @@ function accountDisplayName(account) {
 
 function accountSelectorHint(accounts = getDefaultAccounts()) {
   if (accounts.length < 1) {
-    return "no accounts configured; run cx-setup --accounts <N> --migrate or set CX_ACCOUNT_HOMES";
+    return "no accounts configured; run cx-setup --accounts <N> or set CX_ACCOUNT_HOMES";
   }
   const numeric = accounts.map((_, index) => String(index + 1)).join("|");
   const names = accounts.map((account) => account.name).join("|");
@@ -1392,7 +1392,7 @@ function printQuota(results) {
 
 function printNoAccountsConfigured() {
   console.error("[cx] No Codex account homes found.");
-  console.error("[cx] On a new machine, run: cx-setup --accounts <N> --migrate");
+  console.error("[cx] On a new machine, run: cx-setup --accounts <N>");
   console.error("[cx] Or set: CX_ACCOUNT_HOMES=name=/path/to/codex-home,name2=/path/to/other-home");
 }
 

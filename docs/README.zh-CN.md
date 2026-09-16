@@ -15,7 +15,7 @@
 适合这些情况：
 
 - 你有多个 ChatGPT/Codex 账号。
-- 你希望不同账号共享会话记录，方便切号后继续。
+- 你希望额度耗尽时，把中断的会话复制给下一个账号继续。
 - 你不想用模型中转，想保留官方 Codex CLI 的原生功能。
 - 你经常遇到额度限制，希望自动换账号继续。
 
@@ -62,7 +62,7 @@ cx-setup --help
 假设你有 3 个账号，先创建 3 个账号目录：
 
 ```sh
-cx-setup --accounts 3 --migrate
+cx-setup --accounts 3
 ```
 
 它会创建：
@@ -153,13 +153,13 @@ cx remaining
 ```sh
 cx [codex args...]              # 自动选择账号运行 Codex
 cxa [codex args...]             # 自动模式，等价于 cx auto
-cxr [extra resume args...]      # 恢复最后一个会话
+cxr [extra resume args...]      # 恢复所选账号的最后一个会话
 cx status                       # 查看账号状态和已用额度
 cx quota                        # 查看加权总剩余、恢复时间和每账号进度条
 cx --account 2                  # 只用第 2 个账号
 cx --no-trust                   # 不自动写入项目 trust
 cx --no-bypass                  # 不自动加 bypass 参数
-cx-setup --accounts 3 --migrate # 创建 3 个账号目录
+cx-setup --accounts 3 # 创建 3 个账号目录
 cx-setup --list                 # 列出账号目录
 ```
 
@@ -223,42 +223,40 @@ rehash
 
 或者重新打开一个终端。
 
-## 共享哪些东西
+## 独立目录与可选共享
 
-默认共享这些状态：
+默认的 `cx-setup --accounts 3` 只创建缺少的账号目录，并将 `~/.codex/config.toml` 校验后复制到每个新目录。`--home /path/to/source` 可以指定配置来源。新目录权限为 `0700`，配置副本权限为 `0600`。
 
-```text
-sessions
-archived_sessions
-memories
-skills
-shell_snapshots
-cache
-generated_images
-history.jsonl
-models_cache.json
-```
+- 来源配置及其中的 `notify` 保持原样。
+- 已有目录、配置、登录信息和链接不变。增大 `--accounts` 只初始化新增目录；重复运行不会同步之后的配置修改。
+- 不复制或链接 `auth.json`，每个账号分别登录。
+- setup 不复制 skills/plugins、历史、缓存或 SQLite 数据库。
+- 自动切换时，只将精确匹配的中断会话复制到下一账号，原文件保留；目标副本冲突时停止。
+- `cxr` / `resume --last` 读取所选账号的历史。要指定保存位置，可使用 `cx --account 1 resume --last`，或为该账号指定会话 ID。自动模式中已经运行的会话仍可在额度耗尽时复制并恢复。
+- 创建独立目录不修改已有目录或共享数据，因此不检查运行中的 Codex，也不要求退出 Codex。
 
-重点：
+### 可选共享存储
 
-- 会话记录会共享，所以切号后更容易继续。
-- `auth.json` 不会共享。
-- 每个账号仍然保留自己的登录状态。
-- `config.toml` 不会软链共享。每个账号可以保留自己的认证、provider、
-  profile、model 和项目 trust 设置。
-- setup 时，如果共享的 `~/.codex/config.toml` 里有 `notify` 这类只能放在
-  用户级配置的顶层项，会复制到每个选中的账号 `config.toml`，然后从共享文件
-  移除。这样 `~/.codex/config.toml` 被 Codex 当作项目本地 `.codex` 层读取时，
-  不会再触发启动告警。
-- 多行数组和字符串按完整 TOML 值解析。修改目录前验证所有配置输出；原文件保存为权限 `0600` 的 `config.toml.cx-backup-*`，配置写入失败时恢复已写文件。无关设置和注释保留；无效 TOML 和软链配置会被拒绝。备份保留供恢复使用；整个目录迁移并非原子事务。
-
-如果你还想共享日志、goals、state、memories sqlite 文件：
+显式启用共享链接：
 
 ```sh
+cx-setup --accounts 3 --share
+```
+
+共享项为 `sessions`、`archived_sessions`、`memories`、`skills`、`shell_snapshots`、`cache`、`generated_images`、`history.jsonl` 和 `models_cache.json`。
+
+账号目录已有这些内容时，`--migrate` 将其合并到共享目录，备份原内容后建立链接。`--full` 还包括日志和 SQLite/WAL：
+
+```sh
+cx-setup --accounts 3 --share --migrate
 cx-setup --accounts 3 --full --migrate
 ```
 
-setup、移除、prune 和 `--full` 迁移前，请退出 Codex 会话和 app-server。Linux 检查显式和默认 home，也检查其他运行账号引用的共享状态。macOS 的 `ps` 无法可靠区分每个进程的 home，因此检测到任何 Codex 进程时保守地停止修改。无法读取进程状态时也会停止。`--allow-active` 是显式承担风险的覆盖选项，仅在相关状态空闲时使用。检查无法阻止其他进程在检查后启动。`--full` 共享 SQLite/WAL，并不保证并发写入安全。
+为兼容旧命令，单独指定 `--migrate` 或 `--full` 也会启用共享；单独 `--force` 不会。默认 setup 不会拆除已有共享链接。
+
+共享模式仍会把共享配置中的 `notify` 迁移到各账号配置。多行值完整解析，修改前校验，原配置以 `0600` 权限备份，配置写入失败时恢复。目录迁移并非原子事务。
+
+共享/迁移、移除/prune、更新已有 API-key 账号仍检查 Codex 是否运行。Linux 检查显式/默认 home 及共享资源；macOS 无法确认具体 home 时保守地停止这些操作。普通独立目录创建跳过该检查。`--allow-active` 是显式覆盖选项。执行受保护操作时应让相关数据保持空闲；检查无法阻止其他进程随后启动，共享 SQLite/WAL 仍需注意并发写入。
 
 ## API key 账号
 
@@ -267,13 +265,13 @@ setup、移除、prune 和 `--full` 迁移前，请退出 Codex 会话和 app-se
 推荐从环境变量读取 key：
 
 ```sh
-OPENAI_API_KEY=sk-... cx-setup --add-api-key free --api-key-env OPENAI_API_KEY --openai-base-url https://proxy.example.com/v1 --model gpt-5.5 --api-key-check --migrate
+OPENAI_API_KEY=sk-... cx-setup --add-api-key free --api-key-env OPENAI_API_KEY --openai-base-url https://proxy.example.com/v1 --model gpt-5.5 --api-key-check
 ```
 
 或者从 stdin 读取，避免 key 留在 shell 历史里：
 
 ```sh
-printf '%s' "$OPENAI_API_KEY" | cx-setup --add-api-key free --api-key-stdin --openai-base-url https://proxy.example.com/v1 --model gpt-5.5 --api-key-check --migrate
+printf '%s' "$OPENAI_API_KEY" | cx-setup --add-api-key free --api-key-stdin --openai-base-url https://proxy.example.com/v1 --model gpt-5.5 --api-key-check
 ```
 
 默认选择策略是：
@@ -300,7 +298,7 @@ cx-setup --api-key-mode prefer
 例如原来有 3 个账号，现在要加到 4 个：
 
 ```sh
-cx-setup --accounts 4 --migrate
+cx-setup --accounts 4
 CODEX_HOME="$HOME/.codex-account4" codex login
 ```
 
@@ -325,7 +323,7 @@ cx-setup --remove 3
 如果你不想用 `~/.codex-account1` 这种编号目录：
 
 ```sh
-cx-setup --homes work=~/.codex-work,school=~/.codex-school --migrate
+cx-setup --homes work=~/.codex-work,school=~/.codex-school
 ```
 
 使用时：
@@ -411,7 +409,7 @@ codex exec resume <interrupted-session-id> "Continue the interrupted task ..."
 先创建账号目录：
 
 ```sh
-cx-setup --accounts 3 --migrate
+cx-setup --accounts 3
 ```
 
 `missing ~/.codex-accountN/auth.json`
@@ -455,7 +453,7 @@ cx-setup --install-codex-wrapper --force
 
 `cx status` 不显示 active
 
-Linux 使用 `/proc`，macOS 使用 `ps`。无法可靠识别 home 时显示 `unknown`，选择账号时保守处理，setup 则停止修改。macOS 上执行 setup 前请退出所有 Codex 会话和 app-server。
+Linux 使用 `/proc`，macOS 使用 `ps`。无法可靠识别 home 时显示 `unknown`，选择账号时保守处理。创建独立目录不受此检查阻止；共享/迁移、移除和更新已有 API-key 账号仍保留检查，macOS 上这些操作可能要求退出 Codex。
 
 API key 校验失败
 

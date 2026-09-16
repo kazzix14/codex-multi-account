@@ -634,8 +634,10 @@ function runVirtualE2e() {
 
   const unsharedOne = path.join(root, "unshared-account1");
   const unsharedTwo = path.join(root, "unshared-account2");
-  fs.mkdirSync(unsharedOne, { recursive: true });
-  fs.mkdirSync(unsharedTwo, { recursive: true });
+  const independentSetup = run("cx-setup", ["--homes", `one=${unsharedOne},two=${unsharedTwo}`]);
+  assert.equal(independentSetup.status, 0, independentSetup.stderr);
+  assert.equal(fs.existsSync(path.join(unsharedOne, "sessions")), false);
+  assert.equal(fs.existsSync(path.join(unsharedTwo, "sessions")), false);
   fs.writeFileSync(path.join(unsharedOne, "auth.json"), "{}\n");
   fs.writeFileSync(path.join(unsharedTwo, "auth.json"), "{}\n");
   clearRecords();
@@ -657,6 +659,11 @@ function runVirtualE2e() {
     true,
     "the interrupted session should be copied into the next account home when sessions are not shared",
   );
+  const fromSession = path.join(unsharedOne, "sessions", "2026", "06", "04", "rollout-e2e.jsonl");
+  const toSession = path.join(unsharedTwo, "sessions", "2026", "06", "04", "rollout-e2e.jsonl");
+  assert.equal(fs.lstatSync(path.join(unsharedTwo, "sessions")).isSymbolicLink(), false);
+  assert.notEqual(fs.statSync(fromSession).ino, fs.statSync(toSession).ino);
+  assert.equal(fs.readFileSync(fromSession, "utf8"), fs.readFileSync(toSession, "utf8"));
 
   for (const status of ["paused", "blocked", "usageLimited", "active", "complete"]) {
     clearRecords();

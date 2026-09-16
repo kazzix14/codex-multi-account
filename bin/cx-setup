@@ -43,8 +43,9 @@ function usage() {
   cx-setup [options]
 
 What it does:
-  cx-setup creates account CODEX_HOME directories and links shared workspace
-  state from one shared Codex home. It never links or shares auth.json; each
+  cx-setup creates independent account CODEX_HOME directories and copies
+  config.toml into newly created homes. Existing homes and the source stay
+  unchanged. It never links or shares auth.json; each
   account keeps its own login or API-key credentials. codex-multi-account keeps requests
   on the official Codex CLI path instead of relaying model traffic, so original
   Codex features remain available and account handoff can resume interrupted
@@ -52,7 +53,7 @@ What it does:
 
 Common workflows:
   First time with 3 accounts:
-    cx-setup --accounts 3 --migrate
+    cx-setup --accounts 3
     CODEX_HOME="$HOME/.codex-account1" codex login
     CODEX_HOME="$HOME/.codex-account2" codex login
     CODEX_HOME="$HOME/.codex-account3" codex login
@@ -62,28 +63,28 @@ Common workflows:
   List discovered/configured accounts without changing files:
     cx-setup --list
 
-  Add one more numbered account to an existing full setup:
-    cx-setup --accounts 3 --full --migrate
+  Add one more numbered account:
+    cx-setup --accounts 3
     CODEX_HOME="$HOME/.codex-account3" codex login
 
   Create numbered accounts with shared sessions:
-    cx-setup --accounts <N> --migrate
+    cx-setup --accounts <N> --share
 
   Create numbered accounts with full shared state:
     cx-setup --accounts <N> --full --migrate
 
   Use custom named account homes:
-    cx-setup --homes work=~/.codex-work,school=~/.codex-school --full --migrate
+    cx-setup --homes work=~/.codex-work,school=~/.codex-school
 
   Use an isolated shared workspace and matching numbered account prefix:
     cx-setup --accounts <N> --home ~/.codex-shared --prefix ~/.codex-account --full --migrate
 
   Remove one account or prune old discovered accounts:
     cx-setup --remove free
-    cx-setup --accounts 2 --prune --migrate
+    cx-setup --accounts 2 --prune
 
   Create an API-key account:
-    printf '%s' "$OPENAI_API_KEY" | cx-setup --add-api-key free --api-key-stdin --openai-base-url https://proxy.example.com/v1 --model gpt-5.5 --api-key-check --migrate
+    printf '%s' "$OPENAI_API_KEY" | cx-setup --add-api-key free --api-key-stdin --openai-base-url https://proxy.example.com/v1 --model gpt-5.5 --api-key-check
 
   Install the optional codex PATH wrapper:
     cx-setup --install-codex-wrapper --force
@@ -120,17 +121,19 @@ Options:
                         persist project trust before launching the real Codex CLI.
   --codex-wrapper-bin DIR
                         Directory for --install-codex-wrapper. Default: ~/.local/bin.
-  --home DIR            Shared Codex home. Default: ~/.codex.
+  --home DIR            Source for the initial config copy; shared home with
+                        --share/--migrate/--full. Default: ~/.codex.
   --prefix PREFIX       Prefix for numbered account homes. Default: ~/.codex-account.
-  --full                Also share Codex logs, goals, memories, and state sqlite files.
-  --migrate             Copy existing selected shared items into the shared home
+  --share               Opt into shared workspace links instead of independent homes.
+  --full                Enable sharing, including logs, goals, memories and SQLite files.
+  --migrate             Enable sharing and copy existing selected items into the shared home
                         before replacing those account paths with symlinks.
   --force               Move existing non-symlink paths to backups without copying first.
   --allow-active        Do not refuse active Codex account homes. Risky with --full.
   --dry-run             Print actions without changing files.
 
 Shared items:
-  Default:
+  With --share or --migrate:
     sessions, archived_sessions, memories, skills, shell_snapshots, cache,
     generated_images, history.jsonl, models_cache.json
 
@@ -139,14 +142,20 @@ Shared items:
     memories_1.sqlite*, state_5.sqlite*
 
 Config sync:
-  config.toml is never symlinked because each account can need its own auth,
-  provider, profile, model, or project-trust settings. If the shared home has
+  By default, new homes receive a private copy of the source config.toml.
+  Re-running setup preserves all existing homes, including their configs and links.
+  Source files, auth.json, session history and SQLite databases are not moved.
+  Other files (including skills and plugins) are not copied automatically.
+  Automatic account handoff copies only the exact interrupted conversation.
+  config.toml is never symlinked. In explicit sharing mode, if the shared home has
   top-level user-only settings such as notify, cx-setup copies them into every
   selected account config.toml and removes them from the shared config.toml so
   Codex will not warn when the shared home is seen as a project-local .codex layer.
 
 Important:
-  Exit running Codex sessions before real --full/--migrate runs.
+  Creating independent homes does not require exiting Codex.
+  Sharing/migration, removal, and updates to existing API-key homes still check
+  for active Codex processes. Stop relevant sessions before those operations.
   After --full, avoid multiple concurrent Codex instances that write state unless
   you accept the usual shared-SQLite concurrency risk.
   Log in once per ChatGPT account with:
@@ -162,6 +171,7 @@ function parseArgs(argv) {
     homes: null,
     sharedHome: path.join(home, ".codex"),
     prefix: path.join(home, ".codex-account"),
+    share: false,
     full: false,
     migrate: false,
     force: false,
@@ -192,10 +202,16 @@ function parseArgs(argv) {
     }
     if (arg === "--full") {
       options.full = true;
+      options.share = true;
       continue;
     }
     if (arg === "--migrate") {
       options.migrate = true;
+      options.share = true;
+      continue;
+    }
+    if (arg === "--share") {
+      options.share = true;
       continue;
     }
     if (arg === "--force") {
@@ -1156,8 +1172,38 @@ function linkItem(accountHome, sharedHome, item, options) {
   }
 }
 
+function createIndependentHome(account, configText, options) {
+  if (fs.lstatSync(account.home, { throwIfNoEntry: false })) {
+    if (!isDirectory(account.home)) throw new Error(`Account home is not a directory: ${account.home}`);
+    console.log(`kept existing home ${account.home}`);
+    return;
+  }
+  if (options.dryRun) {
+    console.log(`[dry-run] create independent home ${account.home}`);
+    if (configText !== null) console.log(`[dry-run] copy config.toml to ${account.home}`);
+    return;
+  }
+  fs.mkdirSync(path.dirname(account.home), { recursive: true, mode: 0o700 });
+  try {
+    // Non-recursive creation claims only a new home. Never initialize a home
+    // another process created after the preflight, or overwrite its config.
+    fs.mkdirSync(account.home, { mode: 0o700 });
+  } catch (error) {
+    if (error.code === "EEXIST" && isDirectory(account.home)) {
+      console.log(`kept concurrently created home ${account.home}`);
+      return;
+    }
+    throw error;
+  }
+  if (configText !== null) {
+    fs.writeFileSync(path.join(account.home, "config.toml"), configText, { flag: "wx", mode: 0o600 });
+  }
+  console.log(`created independent home ${account.home}`);
+}
+
 async function setup(options) {
   const items = options.full ? fullSharedItems : defaultSharedItems;
+  const sharing = options.share || options.full || options.migrate;
   const sharedHome = path.resolve(options.sharedHome);
   const hasConfiguredHomes = options.accounts !== null || Boolean(options.homes) || Boolean(options.addApiKey);
   const shouldConfigureHomes =
@@ -1195,15 +1241,24 @@ async function setup(options) {
 
   const uniqueRemoveTargets = [...new Map(removeTargets.map((account) => [account.home, account])).values()];
   const removedHomes = new Set(uniqueRemoveTargets.map((account) => account.home));
-  const remainingHomes = homes.filter((account) => !removedHomes.has(account.home));
-  const touchedHomes = [...uniqueRemoveTargets.map((account) => account.home),
-    ...remainingHomes.map((account) => account.home), ...(remainingHomes.length ? [sharedHome] : [])];
+  const remainingHomes = shouldConfigureHomes ? homes.filter((account) => !removedHomes.has(account.home)) : [];
+  const exists = (account) => Boolean(fs.lstatSync(account.home, { throwIfNoEntry: false }));
+  const touchedHomes = [
+    ...uniqueRemoveTargets.filter(exists).map((account) => account.home),
+    ...(sharing && remainingHomes.length ? [...remainingHomes.map((account) => account.home), sharedHome] : []),
+    ...remainingHomes.filter((account) => account.name.toLowerCase() === options.addApiKey?.toLowerCase() && exists(account))
+      .map((account) => account.home),
+  ];
   const checkInactive = () => {
     if (touchedHomes.length && !options.allowActive && !options.dryRun) assertHomesInactive(touchedHomes, items);
   };
   checkInactive();
   // Validate every config before any home is moved or linked.
-  const configPlan = remainingHomes.length ? planSharedUserConfig(sharedHome, remainingHomes) : [];
+  const configPlan = sharing && remainingHomes.length ? planSharedUserConfig(sharedHome, remainingHomes) : [];
+  // Read a validated snapshot, without changing the source or existing homes.
+  // In particular, notify stays in the source when using independent homes.
+  const initialConfig = !sharing && remainingHomes.some((account) => !exists(account))
+    ? readConfig(path.join(sharedHome, "config.toml")).original : null;
   if (options.apiKeyMode) {
     writeLocalConfigPatch({ apiKeyMode: options.apiKeyMode }, options);
   }
@@ -1225,19 +1280,20 @@ async function setup(options) {
   checkInactive(); // Endpoint preflight may have taken time; inspect again before mutation.
   for (const account of uniqueRemoveTargets) removeAccountHome(account, options);
   if (!remainingHomes.length) return;
-  ensureDir(sharedHome, options);
-
-  for (const { home: accountHome } of remainingHomes) {
-    checkInactive();
-    ensureDir(accountHome, options);
-    for (const item of items) {
-      linkItem(accountHome, sharedHome, item, options);
+  if (sharing) {
+    ensureDir(sharedHome, options);
+    for (const { home: accountHome } of remainingHomes) {
+      checkInactive();
+      ensureDir(accountHome, options);
+      for (const item of items) linkItem(accountHome, sharedHome, item, options);
+      console.log(`configured shared home ${accountHome}`);
     }
-    console.log(`configured ${accountHome}`);
+    checkInactive();
+    commitConfigs(configPlan, options);
+    if (configPlan.length) console.log(`synced notify from ${sharedHome}/config.toml to ${remainingHomes.length} account config.toml file(s)`);
+  } else {
+    for (const account of remainingHomes) createIndependentHome(account, initialConfig, options);
   }
-  checkInactive();
-  commitConfigs(configPlan, options);
-  if (configPlan.length) console.log(`synced notify from ${sharedHome}/config.toml to ${remainingHomes.length} account config.toml file(s)`);
 
   if (options.addApiKey) {
     await writeApiKeyAccount(apiKeyAccount, options);

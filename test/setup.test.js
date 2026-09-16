@@ -35,6 +35,10 @@ function cleanEnv(extra = {}) {
   assert.equal(options.accounts, null);
   assert.equal(options.homes, null);
   assert.equal(options.list, false);
+  assert.equal(options.share, false);
+  assert.equal(parseArgs(["--share"]).share, true);
+  assert.equal(parseArgs(["--migrate"]).share, true);
+  assert.equal(parseArgs(["--full"]).share, true);
 }
 
 {
@@ -124,6 +128,71 @@ assert.throws(
   () => parseArgs(["--add-api-key", "free", "--api-key", "sk-test", "--openai-base-url", "ftp://example.com/v1"]),
   /must use http or https/,
 );
+
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cx-independent-setup-"));
+  const setup = path.resolve(__dirname, "../bin/cx-setup");
+  const source = path.join(root, ".codex");
+  const sourceConfig = '# keep formatting\nnotify = [\n  "/bin/echo",\n  "done",\n]\nmodel = "fixture-model"\n[mcp_servers.fixture]\ncommand = "fixture-mcp"\n';
+  fs.mkdirSync(source);
+  fs.writeFileSync(path.join(source, "config.toml"), sourceConfig);
+  fs.writeFileSync(path.join(source, "auth.json"), '{"fixture":"do-not-copy"}\n');
+  fs.writeFileSync(path.join(source, "state_5.sqlite"), "do-not-copy-database");
+  fs.mkdirSync(path.join(source, "sessions"));
+  fs.writeFileSync(path.join(source, "sessions", "fixture.jsonl"), "do-not-copy-history");
+  const beforeMtime = fs.statSync(path.join(source, "config.toml")).mtimeMs;
+  const run = (...args) => spawnSync(process.execPath, [setup, ...args], {
+    env: cleanEnv({ HOME: root }), encoding: "utf8",
+  });
+  try {
+    let result = run("--accounts", "2", "--dry-run");
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(path.join(root, ".codex-account1")), false);
+    result = run("--accounts", "2");
+    assert.equal(result.status, 0, result.stderr);
+    for (const suffix of ["1", "2"]) {
+      const home = path.join(root, `.codex-account${suffix}`);
+      assert.deepEqual(fs.readdirSync(home), ["config.toml"]);
+      assert.equal(fs.readFileSync(path.join(home, "config.toml"), "utf8"), sourceConfig);
+      assert.equal(fs.statSync(home).mode & 0o777, 0o700);
+      assert.equal(fs.statSync(path.join(home, "config.toml")).mode & 0o777, 0o600);
+      assert.equal(fs.lstatSync(path.join(home, "config.toml")).isSymbolicLink(), false);
+    }
+    assert.equal(fs.readFileSync(path.join(source, "config.toml"), "utf8"), sourceConfig);
+    assert.equal(fs.statSync(path.join(source, "config.toml")).mtimeMs, beforeMtime);
+    assert.deepEqual(fs.readdirSync(source).sort(), ["auth.json", "config.toml", "sessions", "state_5.sqlite"]);
+    const one = path.join(root, ".codex-account1");
+    fs.writeFileSync(path.join(one, "config.toml"), 'model = "per-account"\n');
+    fs.writeFileSync(path.join(one, "auth.json"), "existing-auth\n");
+    fs.symlinkSync(path.join(source, "sessions"), path.join(one, "sessions"));
+    result = run("--accounts", "3");
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(path.join(one, "config.toml"), "utf8"), 'model = "per-account"\n');
+    assert.equal(fs.readFileSync(path.join(one, "auth.json"), "utf8"), "existing-auth\n");
+    assert.equal(fs.lstatSync(path.join(one, "sessions")).isSymbolicLink(), true);
+    assert.equal(fs.readFileSync(path.join(root, ".codex-account3", "config.toml"), "utf8"), sourceConfig);
+    // A no-op repeat doesn't even read the source config.
+    fs.writeFileSync(path.join(source, "config.toml"), "invalid = [");
+    result = run("--accounts", "3");
+    assert.equal(result.status, 0, result.stderr);
+    result = run("--accounts", "4");
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /Invalid TOML/);
+    assert.equal(fs.existsSync(path.join(root, ".codex-account4")), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}
+
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cx-empty-source-"));
+  try {
+    const result = spawnSync(process.execPath, [path.resolve(__dirname, "../bin/cx-setup"), "--accounts", "2"], {
+      env: cleanEnv({ HOME: root }), encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(path.join(root, ".codex")), false);
+    assert.deepEqual(fs.readdirSync(path.join(root, ".codex-account1")), []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}
 
 {
   const setup = path.resolve(__dirname, "../bin/cx-setup");

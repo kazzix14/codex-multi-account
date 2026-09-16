@@ -7,8 +7,8 @@ The installed commands are still short:
 ```sh
 cx        # run Codex with automatic account selection
 cxa       # same idea, explicit auto mode
-cxr       # resume the last conversation
-cx-setup  # create account folders and shared state
+cxr       # resume the selected account's last conversation
+cx-setup  # create independent account folders
 ```
 
 ## Install
@@ -23,10 +23,10 @@ This is the kazzix14 fork of [rmqg/codex-multi-account](https://github.com/rmqg/
 
 ## First Setup
 
-Exit Codex sessions and app-servers before setup. On macOS, setup conservatively blocks mutations while any Codex process is running. Create account folders; replace `3` with your account count.
+Create independent account folders; replace `3` with your account count. Codex can keep running during this setup.
 
 ```sh
-cx-setup --accounts 3 --migrate
+cx-setup --accounts 3
 ```
 
 Log in once per account:
@@ -44,11 +44,11 @@ cx status
 cx quota
 ```
 
-`cx-setup` does not symlink `config.toml`: each account can need its own
-login/provider/profile defaults. If your shared `~/.codex/config.toml` contains
-top-level user-only settings such as `notify`, setup syncs them into every
-account config and removes them from the shared config so Codex will not treat
-them as unsupported project-local settings. Multiline values are parsed in full; all affected TOML files are validated before mutation, backed up with mode `0600`, and restored if a config write fails.
+New account homes receive a private copy of `~/.codex/config.toml` (or the `--home` source). The source stays unchanged, including `notify`. Existing account homes are left untouched when you rerun setup. The initial copy is not kept in sync afterward.
+
+Authentication, skills/plugins, history, and SQLite databases are not copied during setup. Log in separately for each account. During automatic handoff, only the exact interrupted conversation is copied to the next account. Independent homes do not expose all past conversations to every account: `cxr` resumes the selected account's last conversation, or use `cx --account 1 resume --last` to choose its home explicitly.
+
+Sharing is optional: `--share` creates shared links; `--migrate` and `--full` retain their existing sharing behavior. Those modes, account removal, and updates to existing API-key accounts still use the activity guard. On macOS that guard can require all Codex processes to exit; ordinary independent setup skips it because it leaves existing homes untouched.
 
 `cx quota` shows a weighted weekly total first, then one weekly bar and reset time for each account.
 It identifies the weekly quota by Codex's reported 10080-minute window instead of assuming `primary` or `secondary` means a fixed quota type.
